@@ -6570,3 +6570,3646 @@ export class CRMAdvancedService {
   }
 }
 ```
+
+
+---
+
+## Módulo de Producción Avanzado (MRP II, Capacidad, Costeo Real)
+
+### Planificación de Capacidad
+
+```typescript
+// apps/backend/src/modules/production/mrp.service.ts
+@Injectable()
+export class MRPService {
+  constructor(private prisma: PrismaService) {}
+
+  async runMRP(productId: string, requiredQuantity: number, requiredDate: Date) {
+    const bom = await this.prisma.billOfMaterial.findUnique({
+      where: { productId },
+      include: { components: { include: { component: true } } },
+    });
+    if (!bom) throw new NotFoundException('No existe BOM para este producto');
+
+    const requirements = [];
+    for (const comp of bom.components) {
+      const needed = (comp.quantity / bom.quantity) * requiredQuantity;
+      const available = comp.component.stock;
+      const shortage = Math.max(0, needed - available);
+
+      requirements.push({
+        productId: comp.componentId,
+        productName: comp.component.name,
+        required: needed,
+        available,
+        shortage,
+        needsPurchase: shortage > 0,
+        estimatedCost: shortage * comp.component.cost,
+      });
+    }
+
+    const totalShortage = requirements.filter(r => r.needsPurchase);
+    const canProduce = totalShortage.length === 0;
+
+    return {
+      productId,
+      requiredQuantity,
+      requiredDate,
+      canProduce,
+      requirements,
+      totalEstimatedCost: requirements.reduce((s, r) => s + r.estimatedCost, 0),
+      suggestedPurchases: totalShortage,
+    };
+  }
+
+  async calculateProductionCost(orderId: string) {
+    const order = await this.prisma.productionOrder.findUnique({
+      where: { id: orderId },
+      include: {
+        consumed: { include: { product: true } },
+        produced: { include: { product: true } },
+      },
+    });
+    if (!order) throw new NotFoundException('Orden no encontrada');
+
+    const materialCost = order.consumed.reduce((s, c) => s + c.quantity * (c.unitCost || c.product.cost), 0);
+    const laborCost = (order.laborHours || 0) * (order.laborRate || 0);
+    const overheadCost = materialCost * 0.15; // 15% overhead por defecto
+    const totalCost = materialCost + laborCost + overheadCost;
+    const totalProduced = order.produced.reduce((s, p) => s + p.quantity, 0);
+    const unitCost = totalProduced > 0 ? totalCost / totalProduced : 0;
+
+    return { orderId, materialCost, laborCost, overheadCost, totalCost, totalProduced, unitCost };
+  }
+
+  async getProductionSchedule(from: Date, to: Date) {
+    const orders = await this.prisma.productionOrder.findMany({
+      where: { startDate: { gte: from }, status: { in: ['PLANNED', 'IN_PROGRESS'] } },
+      include: { product: true },
+      orderBy: { startDate: 'asc' },
+    });
+
+    // Detectar conflictos de capacidad (simplificado: máx 8h/día)
+    const schedule: Record<string, any[]> = {};
+    for (const order of orders) {
+      const dateKey = order.startDate.toISOString().slice(0, 10);
+      if (!schedule[dateKey]) schedule[dateKey] = [];
+      schedule[dateKey].push(order);
+    }
+
+    return Object.entries(schedule).map(([date, dayOrders]) => ({
+      date,
+      orders: dayOrders,
+      totalHours: dayOrders.reduce((s, o) => s + (o.estimatedHours || 0), 0),
+      overCapacity: dayOrders.reduce((s, o) => s + (o.estimatedHours || 0), 0) > 8,
+    }));
+  }
+}
+```
+
+### Modelo adicional para producción
+
+```prisma
+// Añadir a ProductionOrder:
+// laborHours   Float?
+// laborRate    Float?
+// estimatedHours Float?
+// overhead     Float?
+```
+
+
+---
+
+## Módulo de Seguridad Avanzada
+
+### Rate Limiting por Usuario + Detección de Anomalías de Acceso
+
+```typescript
+// apps/backend/src/common/guards/security.guard.ts
+import { Injectable, CanActivate, ExecutionContext, ForbiddenException } from '@nestjs/common';
+import { InjectRedis } from '@nestjs-modules/ioredis';
+import Redis from 'ioredis';
+
+@Injectable()
+export class SecurityGuard implements CanActivate {
+  constructor(@InjectRedis() private redis: Redis) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const req = context.switchToHttp().getRequest();
+    const userId = req.user?.sub;
+    const ip = req.ip;
+    const endpoint = `${req.method}:${req.path}`;
+
+    if (!userId) return true;
+
+    // Rate limit por usuario: 200 req/min
+    const userKey = `rl:user:${userId}`;
+    const userCount = await this.redis.incr(userKey);
+    if (userCount === 1) await this.redis.expire(userKey, 60);
+    if (userCount > 200) throw new ForbiddenException('Demasiadas solicitudes');
+
+    // Detectar acceso desde IP inusual
+    const knownIPs = await this.redis.smembers(`known_ips:${userId}`);
+    if (knownIPs.length > 0 && !knownIPs.includes(ip) && knownIPs.length >= 3) {
+      // Registrar alerta (no bloquear, solo alertar)
+      await this.redis.lpush(`security_alerts:${userId}`, JSON.stringify({ ip, endpoint, timestamp: Date.now() }));
+      await this.redis.expire(`security_alerts:${userId}`, 86400);
+    }
+    await this.redis.sadd(`known_ips:${userId}`, ip);
+    await this.redis.expire(`known_ips:${userId}`, 86400 * 30);
+
+    return true;
+  }
+}
+```
+
+### Encriptación de Datos Sensibles
+
+```typescript
+// apps/backend/src/common/crypto.service.ts
+import * as crypto from 'crypto';
+
+@Injectable()
+export class CryptoService {
+  private readonly algorithm = 'aes-256-gcm';
+  private readonly key: Buffer;
+
+  constructor() {
+    this.key = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex'); // 32 bytes hex
+  }
+
+  encrypt(text: string): string {
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv(this.algorithm, this.key, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag();
+    return `${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted}`;
+  }
+
+  decrypt(encryptedText: string): string {
+    const [ivHex, authTagHex, encrypted] = encryptedText.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const authTag = Buffer.from(authTagHex, 'hex');
+    const decipher = crypto.createDecipheriv(this.algorithm, this.key, iv);
+    decipher.setAuthTag(authTag);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  }
+}
+
+// Uso: encriptar cuentas bancarias de empleados, RIFs, etc.
+// employee.bankAccount = this.crypto.encrypt(bankAccount);
+```
+
+### Política de Contraseñas
+
+```typescript
+// apps/backend/src/modules/auth/password-policy.service.ts
+@Injectable()
+export class PasswordPolicyService {
+  validate(password: string): { valid: boolean; errors: string[] } {
+    const errors: string[] = [];
+    if (password.length < 10) errors.push('Mínimo 10 caracteres');
+    if (!/[A-Z]/.test(password)) errors.push('Al menos una mayúscula');
+    if (!/[a-z]/.test(password)) errors.push('Al menos una minúscula');
+    if (!/[0-9]/.test(password)) errors.push('Al menos un número');
+    if (!/[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]/.test(password)) errors.push('Al menos un carácter especial');
+    return { valid: errors.length === 0, errors };
+  }
+
+  async isPasswordReused(userId: string, newPasswordHash: string, prisma: PrismaService): Promise<boolean> {
+    const history = await prisma.passwordHistory.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+    });
+    const bcrypt = await import('bcrypt');
+    for (const h of history) {
+      if (await bcrypt.compare(newPasswordHash, h.hash)) return true;
+    }
+    return false;
+  }
+}
+```
+
+
+---
+
+## Módulo de IA Avanzada: Predicción de Morosidad y Recomendaciones
+
+### Predicción de Morosidad con ML
+
+```typescript
+// apps/backend/src/modules/ai/credit-risk.service.ts
+@Injectable()
+export class CreditRiskService {
+  constructor(private prisma: PrismaService, private ai: AIService) {}
+
+  async assessCustomerRisk(customerId: string): Promise<{
+    riskScore: number;
+    riskLevel: 'BAJO' | 'MEDIO' | 'ALTO' | 'CRITICO';
+    factors: string[];
+    recommendation: string;
+  }> {
+    const customer = await this.prisma.customer.findUnique({
+      where: { id: customerId },
+      include: {
+        sales: { where: { status: 'INVOICED' }, include: { receivable: true } },
+        receivables: { orderBy: { createdAt: 'desc' }, take: 20 },
+      },
+    });
+    if (!customer) throw new NotFoundException('Cliente no encontrado');
+
+    const factors: string[] = [];
+    let riskScore = 0;
+
+    // Factor 1: Historial de pagos
+    const overdueCount = customer.receivables.filter(r => r.status === 'OVERDUE').length;
+    const paidCount = customer.receivables.filter(r => r.status === 'PAID').length;
+    const paymentRate = customer.receivables.length > 0 ? paidCount / customer.receivables.length : 1;
+    if (paymentRate < 0.7) { riskScore += 30; factors.push('Historial de pagos deficiente'); }
+    else if (paymentRate < 0.9) { riskScore += 15; factors.push('Algunos pagos tardíos'); }
+
+    // Factor 2: Días promedio de pago
+    const paidReceivables = customer.receivables.filter(r => r.status === 'PAID' && r.paidAt);
+    if (paidReceivables.length > 0) {
+      const avgDays = paidReceivables.reduce((s, r) => {
+        return s + Math.floor((new Date(r.paidAt!).getTime() - new Date(r.dueDate).getTime()) / 86400000);
+      }, 0) / paidReceivables.length;
+      if (avgDays > 30) { riskScore += 25; factors.push(`Paga ${Math.round(avgDays)} días tarde en promedio`); }
+      else if (avgDays > 15) { riskScore += 10; factors.push('Paga con ligero retraso'); }
+    }
+
+    // Factor 3: Deuda actual
+    const currentDebt = customer.receivables.filter(r => ['PENDING', 'PARTIAL', 'OVERDUE'].includes(r.status))
+      .reduce((s, r) => s + r.balance, 0);
+    const totalPurchases = customer.sales.reduce((s, sale) => s + sale.total, 0);
+    const debtRatio = totalPurchases > 0 ? currentDebt / totalPurchases : 0;
+    if (debtRatio > 0.5) { riskScore += 25; factors.push('Alta deuda pendiente vs compras totales'); }
+    else if (debtRatio > 0.3) { riskScore += 10; factors.push('Deuda moderada'); }
+
+    // Factor 4: Cuentas vencidas activas
+    if (overdueCount > 3) { riskScore += 20; factors.push(`${overdueCount} facturas vencidas activas`); }
+    else if (overdueCount > 0) { riskScore += 10; factors.push(`${overdueCount} factura(s) vencida(s)`); }
+
+    const riskLevel = riskScore >= 70 ? 'CRITICO' : riskScore >= 50 ? 'ALTO' : riskScore >= 25 ? 'MEDIO' : 'BAJO';
+    const recommendations: Record<string, string> = {
+      BAJO: 'Cliente confiable. Puede otorgarse crédito normal.',
+      MEDIO: 'Monitorear pagos. Considerar reducir plazo de crédito.',
+      ALTO: 'Requerir pago anticipado o garantías. Límite de crédito reducido.',
+      CRITICO: 'Solo ventas de contado. Gestionar cobro de deuda pendiente.',
+    };
+
+    return { riskScore, riskLevel, factors, recommendation: recommendations[riskLevel] };
+  }
+
+  async getProductRecommendations(customerId: string, limit = 5) {
+    // Productos que compran clientes similares pero este no ha comprado
+    const customerProducts = await this.prisma.saleItem.findMany({
+      where: { sale: { customerId, status: 'INVOICED' } },
+      select: { productId: true },
+      distinct: ['productId'],
+    });
+    const boughtIds = customerProducts.map(p => p.productId);
+
+    // Clientes que compraron los mismos productos
+    const similarCustomers = await this.prisma.saleItem.findMany({
+      where: { productId: { in: boughtIds }, sale: { status: 'INVOICED', customerId: { not: customerId } } },
+      select: { sale: { select: { customerId: true } } },
+      distinct: ['saleId'],
+      take: 50,
+    });
+    const similarIds = [...new Set(similarCustomers.map(s => s.sale.customerId))];
+
+    // Productos que esos clientes compraron y este no
+    const recommendations = await this.prisma.saleItem.groupBy({
+      by: ['productId'],
+      where: {
+        sale: { customerId: { in: similarIds }, status: 'INVOICED' },
+        productId: { notIn: boughtIds },
+      },
+      _count: { productId: true },
+      orderBy: { _count: { productId: 'desc' } },
+      take: limit,
+    });
+
+    const products = await this.prisma.product.findMany({
+      where: { id: { in: recommendations.map(r => r.productId) } },
+    });
+
+    return products.map(p => ({
+      ...p,
+      score: recommendations.find(r => r.productId === p.id)?._count.productId || 0,
+    }));
+  }
+}
+```
+
+### Detección de Duplicados con IA
+
+```typescript
+// apps/backend/src/modules/ai/deduplication.service.ts
+@Injectable()
+export class DeduplicationService {
+  async findDuplicateCustomers(prisma: PrismaService) {
+    const customers = await prisma.customer.findMany();
+    const duplicates: any[] = [];
+
+    for (let i = 0; i < customers.length; i++) {
+      for (let j = i + 1; j < customers.length; j++) {
+        const similarity = this.stringSimilarity(
+          customers[i].businessName.toLowerCase(),
+          customers[j].businessName.toLowerCase()
+        );
+        if (similarity > 0.85) {
+          duplicates.push({ customer1: customers[i], customer2: customers[j], similarity });
+        }
+      }
+    }
+    return duplicates;
+  }
+
+  private stringSimilarity(a: string, b: string): number {
+    const longer = a.length > b.length ? a : b;
+    const shorter = a.length > b.length ? b : a;
+    if (longer.length === 0) return 1.0;
+    return (longer.length - this.editDistance(longer, shorter)) / longer.length;
+  }
+
+  private editDistance(a: string, b: string): number {
+    const matrix = Array.from({ length: b.length + 1 }, (_, i) => [i]);
+    for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+    for (let i = 1; i <= b.length; i++) {
+      for (let j = 1; j <= a.length; j++) {
+        matrix[i][j] = b[i - 1] === a[j - 1]
+          ? matrix[i - 1][j - 1]
+          : Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
+      }
+    }
+    return matrix[b.length][a.length];
+  }
+}
+```
+
+
+---
+
+## Módulo de Importación/Exportación Masiva de Datos
+
+### Servicio de Importación (Excel/CSV)
+
+```typescript
+// apps/backend/src/modules/import/import.service.ts
+import * as ExcelJS from 'exceljs';
+
+@Injectable()
+export class ImportService {
+  constructor(private prisma: PrismaService) {}
+
+  async importProducts(buffer: Buffer): Promise<{ success: number; errors: string[] }> {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(1);
+    if (!ws) throw new BadRequestException('Archivo inválido');
+
+    let success = 0;
+    const errors: string[] = [];
+
+    ws.eachRow(async (row, rowNum) => {
+      if (rowNum === 1) return; // skip header
+      try {
+        const [code, name, price, cost, stock, minStock, categoryName] = row.values as any[];
+        if (!code || !name) { errors.push(`Fila ${rowNum}: código y nombre son requeridos`); return; }
+
+        let category = categoryName ? await this.prisma.category.findFirst({ where: { name: categoryName } }) : null;
+        if (categoryName && !category) {
+          category = await this.prisma.category.create({ data: { name: categoryName } });
+        }
+
+        await this.prisma.product.upsert({
+          where: { code: String(code) },
+          update: { name: String(name), price: Number(price) || 0, cost: Number(cost) || 0, stock: Number(stock) || 0, minStock: Number(minStock) || 0 },
+          create: { code: String(code), name: String(name), price: Number(price) || 0, cost: Number(cost) || 0, stock: Number(stock) || 0, minStock: Number(minStock) || 0, valuation: 'PROMEDIO', categoryId: category?.id },
+        });
+        success++;
+      } catch (e: any) {
+        errors.push(`Fila ${rowNum}: ${e.message}`);
+      }
+    });
+
+    return { success, errors };
+  }
+
+  async importCustomers(buffer: Buffer): Promise<{ success: number; errors: string[] }> {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(1);
+    if (!ws) throw new BadRequestException('Archivo inválido');
+
+    let success = 0;
+    const errors: string[] = [];
+
+    ws.eachRow(async (row, rowNum) => {
+      if (rowNum === 1) return;
+      try {
+        const [businessName, rif, address, phone, email] = row.values as any[];
+        if (!businessName || !rif) { errors.push(`Fila ${rowNum}: razón social y RIF son requeridos`); return; }
+
+        await this.prisma.customer.upsert({
+          where: { rif: String(rif) },
+          update: { businessName: String(businessName), address: address ? String(address) : null, phone: phone ? String(phone) : null, email: email ? String(email) : null },
+          create: { businessName: String(businessName), rif: String(rif), address: address ? String(address) : null, phone: phone ? String(phone) : null, email: email ? String(email) : null },
+        });
+        success++;
+      } catch (e: any) {
+        errors.push(`Fila ${rowNum}: ${e.message}`);
+      }
+    });
+
+    return { success, errors };
+  }
+
+  async generateImportTemplate(type: 'products' | 'customers' | 'employees'): Promise<Buffer> {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Plantilla');
+
+    const templates: Record<string, string[]> = {
+      products: ['Código*', 'Nombre*', 'Precio Venta', 'Costo', 'Stock Inicial', 'Stock Mínimo', 'Categoría'],
+      customers: ['Razón Social*', 'RIF*', 'Dirección', 'Teléfono', 'Email'],
+      employees: ['Nombres*', 'Apellidos*', 'Cédula*', 'Fecha Nacimiento', 'Fecha Ingreso', 'Cargo', 'Salario', 'Banco', 'Cuenta Bancaria'],
+    };
+
+    ws.addRow(templates[type]);
+    ws.getRow(1).font = { bold: true };
+    ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF4F46E5' } };
+    ws.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+
+    // Añadir fila de ejemplo
+    const examples: Record<string, any[]> = {
+      products: ['PROD-001', 'Producto Ejemplo', 100.00, 60.00, 50, 10, 'General'],
+      customers: ['Empresa Ejemplo C.A.', 'J-12345678-9', 'Av. Principal, Caracas', '0212-1234567', 'info@empresa.com'],
+      employees: ['Juan', 'Pérez', 'V-12345678', '1990-01-15', '2020-03-01', 'Analista', 500.00, 'Banesco', '01340123456789012345'],
+    };
+    ws.addRow(examples[type]);
+
+    const buffer = await wb.xlsx.writeBuffer();
+    return Buffer.from(buffer);
+  }
+}
+```
+
+### Controller de Importación
+
+```typescript
+// apps/backend/src/modules/import/import.controller.ts
+@Controller('import')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class ImportController {
+  constructor(private importService: ImportService) {}
+
+  @Post('products')
+  @RequirePermissions('inventario:create')
+  @UseInterceptors(FileInterceptor('file'))
+  importProducts(@UploadedFile() file: Express.Multer.File) {
+    return this.importService.importProducts(file.buffer);
+  }
+
+  @Post('customers')
+  @RequirePermissions('ventas:create')
+  @UseInterceptors(FileInterceptor('file'))
+  importCustomers(@UploadedFile() file: Express.Multer.File) {
+    return this.importService.importCustomers(file.buffer);
+  }
+
+  @Get('template/:type')
+  async getTemplate(@Param('type') type: string, @Res() res: Response) {
+    const buffer = await this.importService.generateImportTemplate(type as any);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=plantilla-${type}.xlsx`);
+    res.send(buffer);
+  }
+}
+```
+
+
+---
+
+## Módulo de Facturación Electrónica SENIAT (XML Real)
+
+### Generador de XML según Providencia SENIAT
+
+```typescript
+// apps/backend/src/modules/sales/invoice-xml.service.ts
+import { create } from 'xmlbuilder2';
+
+@Injectable()
+export class InvoiceXMLService {
+  constructor(private config: SystemConfigService) {}
+
+  async generateXML(sale: any, company: CompanyConfig): Promise<string> {
+    const doc = create({ version: '1.0', encoding: 'UTF-8' })
+      .ele('Factura', {
+        xmlns: 'http://www.seniat.gob.ve/factura',
+        version: '1.0',
+      });
+
+    // ─── Encabezado ───────────────────────────────────────────────────────────
+    const header = doc.ele('Encabezado');
+    header.ele('TipoDocumento').txt('01'); // 01=Factura, 02=NC, 03=ND
+    header.ele('NumeroDocumento').txt(sale.invoiceNumber);
+    header.ele('NumeroControl').txt(sale.invoiceControl);
+    header.ele('FechaEmision').txt(new Date(sale.date).toISOString().slice(0, 10));
+    header.ele('FechaVencimiento').txt(sale.dueDate ? new Date(sale.dueDate).toISOString().slice(0, 10) : '');
+
+    // ─── Emisor ───────────────────────────────────────────────────────────────
+    const emisor = doc.ele('Emisor');
+    emisor.ele('RIF').txt(company.rif);
+    emisor.ele('RazonSocial').txt(company.businessName);
+    emisor.ele('Direccion').txt(company.address);
+    emisor.ele('Telefono').txt(company.phone || '');
+
+    // ─── Receptor ─────────────────────────────────────────────────────────────
+    const receptor = doc.ele('Receptor');
+    receptor.ele('RIF').txt(sale.customer.rif);
+    receptor.ele('RazonSocial').txt(sale.customer.businessName);
+    receptor.ele('Direccion').txt(sale.customer.address || '');
+
+    // ─── Detalles ─────────────────────────────────────────────────────────────
+    const detalles = doc.ele('Detalles');
+    for (const item of sale.items) {
+      const detalle = detalles.ele('Detalle');
+      detalle.ele('Codigo').txt(item.product?.code || '');
+      detalle.ele('Descripcion').txt(item.product?.name || '');
+      detalle.ele('Cantidad').txt(item.quantity.toString());
+      detalle.ele('PrecioUnitario').txt(item.price.toFixed(2));
+      detalle.ele('Descuento').txt('0.00');
+      detalle.ele('BaseImponible').txt(item.subtotal.toFixed(2));
+      detalle.ele('AlicuotaIVA').txt((item.taxRate * 100).toFixed(0));
+      detalle.ele('MontoIVA').txt(item.taxAmount.toFixed(2));
+      detalle.ele('Total').txt(item.total.toFixed(2));
+    }
+
+    // ─── Totales ──────────────────────────────────────────────────────────────
+    const totales = doc.ele('Totales');
+    totales.ele('BaseImponible16').txt(
+      sale.items.filter((i: any) => i.taxRate === 0.16).reduce((s: number, i: any) => s + i.subtotal, 0).toFixed(2)
+    );
+    totales.ele('IVA16').txt(
+      sale.items.filter((i: any) => i.taxRate === 0.16).reduce((s: number, i: any) => s + i.taxAmount, 0).toFixed(2)
+    );
+    totales.ele('BaseImponible8').txt(
+      sale.items.filter((i: any) => i.taxRate === 0.08).reduce((s: number, i: any) => s + i.subtotal, 0).toFixed(2)
+    );
+    totales.ele('IVA8').txt(
+      sale.items.filter((i: any) => i.taxRate === 0.08).reduce((s: number, i: any) => s + i.taxAmount, 0).toFixed(2)
+    );
+    totales.ele('Exento').txt(
+      sale.items.filter((i: any) => i.taxRate === 0).reduce((s: number, i: any) => s + i.subtotal, 0).toFixed(2)
+    );
+    totales.ele('TotalGeneral').txt(sale.total.toFixed(2));
+
+    return doc.end({ prettyPrint: true });
+  }
+
+  async generateInvoiceHTML(sale: any, company: CompanyConfig): Promise<string> {
+    return `
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 11px; margin: 20px; }
+    .header { text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 15px; }
+    .company-name { font-size: 16px; font-weight: bold; }
+    .invoice-title { font-size: 14px; font-weight: bold; color: #4F46E5; margin: 10px 0; }
+    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+    .info-box { border: 1px solid #ddd; padding: 8px; border-radius: 4px; }
+    .info-label { font-weight: bold; color: #666; font-size: 10px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
+    th { background: #4F46E5; color: white; padding: 6px; text-align: left; }
+    td { padding: 5px; border-bottom: 1px solid #eee; }
+    .totals { float: right; width: 300px; }
+    .totals table td { border: none; }
+    .total-final { font-weight: bold; font-size: 13px; background: #f0f0f0; }
+    .footer { margin-top: 30px; text-align: center; font-size: 10px; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="company-name">${company.businessName}</div>
+    <div>RIF: ${company.rif} | ${company.address}</div>
+    <div>${company.phone || ''} | ${company.email || ''}</div>
+    <div class="invoice-title">FACTURA N° ${sale.invoiceNumber}</div>
+    <div>N° Control: ${sale.invoiceControl} | Fecha: ${new Date(sale.date).toLocaleDateString('es-VE')}</div>
+  </div>
+
+  <div class="info-grid">
+    <div class="info-box">
+      <div class="info-label">CLIENTE</div>
+      <div><strong>${sale.customer.businessName}</strong></div>
+      <div>RIF: ${sale.customer.rif}</div>
+      <div>${sale.customer.address || ''}</div>
+    </div>
+    <div class="info-box">
+      <div class="info-label">DATOS DE PAGO</div>
+      <div>Método: ${sale.paymentMethod || 'N/A'}</div>
+      <div>Vencimiento: ${sale.dueDate ? new Date(sale.dueDate).toLocaleDateString('es-VE') : 'Contado'}</div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Código</th><th>Descripción</th><th>Cant.</th>
+        <th>Precio Unit.</th><th>% IVA</th><th>Base Imp.</th><th>IVA</th><th>Total</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${sale.items.map((item: any) => `
+        <tr>
+          <td>${item.product?.code || ''}</td>
+          <td>${item.product?.name || ''}</td>
+          <td>${item.quantity}</td>
+          <td>Bs. ${item.price.toFixed(2)}</td>
+          <td>${(item.taxRate * 100).toFixed(0)}%</td>
+          <td>Bs. ${item.subtotal.toFixed(2)}</td>
+          <td>Bs. ${item.taxAmount.toFixed(2)}</td>
+          <td>Bs. ${item.total.toFixed(2)}</td>
+        </tr>
+      `).join('')}
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <table>
+      <tr><td>Base Imponible 16%:</td><td>Bs. ${sale.items.filter((i: any) => i.taxRate === 0.16).reduce((s: number, i: any) => s + i.subtotal, 0).toFixed(2)}</td></tr>
+      <tr><td>IVA 16%:</td><td>Bs. ${sale.items.filter((i: any) => i.taxRate === 0.16).reduce((s: number, i: any) => s + i.taxAmount, 0).toFixed(2)}</td></tr>
+      <tr><td>Exento:</td><td>Bs. ${sale.items.filter((i: any) => i.taxRate === 0).reduce((s: number, i: any) => s + i.subtotal, 0).toFixed(2)}</td></tr>
+      <tr class="total-final"><td><strong>TOTAL:</strong></td><td><strong>Bs. ${sale.total.toFixed(2)}</strong></td></tr>
+    </table>
+  </div>
+
+  <div class="footer">
+    <p>Este documento es una factura fiscal válida según la Providencia Administrativa del SENIAT.</p>
+    <p>Conserve este documento para sus registros fiscales.</p>
+  </div>
+</body>
+</html>`;
+  }
+}
+```
+
+
+---
+
+## Módulo de Proyectos Avanzado (Gantt, Hitos, Facturación por Avance)
+
+### Modelo de Datos Extendido
+
+```prisma
+model ProjectMilestone {
+  id          String   @id @default(cuid())
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id])
+  name        String
+  description String?
+  dueDate     DateTime
+  completedAt DateTime?
+  billingAmount Float?  // monto a facturar al alcanzar este hito
+  status      String   @default("PENDING") // PENDING, COMPLETED, OVERDUE
+  saleId      String?  // factura generada al completar
+}
+
+model TimeEntry {
+  id          String   @id @default(cuid())
+  taskId      String
+  task        Task     @relation(fields: [taskId], references: [id])
+  employeeId  String
+  employee    Employee @relation(fields: [employeeId], references: [id])
+  date        DateTime
+  hours       Float
+  description String?
+  billable    Boolean  @default(true)
+  hourlyRate  Float?
+  createdAt   DateTime @default(now())
+}
+```
+
+### Servicio de Proyectos Avanzado
+
+```typescript
+// apps/backend/src/modules/projects/projects-advanced.service.ts
+@Injectable()
+export class ProjectsAdvancedService {
+  constructor(private prisma: PrismaService, private sales: SalesService) {}
+
+  async getGanttData(projectId: string) {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      include: {
+        tasks: { include: { timeEntries: true } },
+        milestones: true,
+      },
+    });
+    if (!project) throw new NotFoundException('Proyecto no encontrado');
+
+    return {
+      project: { id: project.id, name: project.name, start: project.startDate, end: project.endDate },
+      tasks: project.tasks.map(t => ({
+        id: t.id,
+        name: t.name,
+        start: t.startDate,
+        end: t.dueDate,
+        progress: t.hoursPlanned && t.hoursActual ? Math.min(100, (t.hoursActual / t.hoursPlanned) * 100) : 0,
+        status: t.status,
+        assignedTo: t.assignedTo,
+        actualHours: t.timeEntries.reduce((s, e) => s + e.hours, 0),
+      })),
+      milestones: project.milestones.map(m => ({
+        id: m.id, name: m.name, date: m.dueDate, status: m.status, billingAmount: m.billingAmount,
+      })),
+    };
+  }
+
+  async completeMilestone(milestoneId: string, userId: string) {
+    const milestone = await this.prisma.projectMilestone.findUnique({
+      where: { id: milestoneId },
+      include: { project: { include: { customer: true } } },
+    });
+    if (!milestone) throw new NotFoundException('Hito no encontrado');
+
+    await this.prisma.projectMilestone.update({
+      where: { id: milestoneId },
+      data: { status: 'COMPLETED', completedAt: new Date() },
+    });
+
+    // Si tiene monto de facturación, generar factura automáticamente
+    if (milestone.billingAmount && milestone.project.customerId) {
+      // Buscar producto "Servicio" genérico o crear uno
+      let serviceProduct = await this.prisma.product.findFirst({ where: { code: 'SRV-PROYECTO' } });
+      if (!serviceProduct) {
+        serviceProduct = await this.prisma.product.create({
+          data: { code: 'SRV-PROYECTO', name: 'Servicio de Proyecto', price: 0, cost: 0, stock: 9999, minStock: 0, valuation: 'PROMEDIO' },
+        });
+      }
+
+      const sale = await this.sales.create({
+        customerId: milestone.project.customerId,
+        items: [{
+          productId: serviceProduct.id,
+          quantity: 1,
+          price: milestone.billingAmount / 1.16, // precio sin IVA
+          taxRate: 0.16,
+        }],
+      }, userId);
+
+      await this.prisma.projectMilestone.update({ where: { id: milestoneId }, data: { saleId: sale.id } });
+      return { milestone, sale };
+    }
+
+    return { milestone };
+  }
+
+  async getProjectProfitability(projectId: string) {
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      include: {
+        tasks: { include: { timeEntries: true } },
+        expenses: true,
+        sales: { where: { status: 'INVOICED' } },
+      },
+    });
+    if (!project) throw new NotFoundException('Proyecto no encontrado');
+
+    const revenue = project.sales.reduce((s, sale) => s + sale.total, 0);
+    const laborCost = project.tasks.reduce((s, t) =>
+      s + t.timeEntries.reduce((ts, e) => ts + e.hours * (e.hourlyRate || 0), 0), 0
+    );
+    const directExpenses = project.expenses.reduce((s, e) => s + e.amount, 0);
+    const totalCost = laborCost + directExpenses;
+    const profit = revenue - totalCost;
+    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
+
+    return {
+      projectId, revenue, laborCost, directExpenses, totalCost, profit,
+      margin: margin.toFixed(2) + '%',
+      status: margin >= 20 ? 'RENTABLE' : margin >= 0 ? 'MARGINAL' : 'PÉRDIDA',
+    };
+  }
+
+  async logTime(taskId: string, employeeId: string, hours: number, date: Date, description?: string, billable = true) {
+    const task = await this.prisma.task.findUnique({ where: { id: taskId } });
+    if (!task) throw new NotFoundException('Tarea no encontrada');
+
+    const entry = await this.prisma.timeEntry.create({
+      data: { taskId, employeeId, date, hours, description, billable },
+    });
+
+    // Actualizar horas reales de la tarea
+    await this.prisma.task.update({
+      where: { id: taskId },
+      data: { hoursActual: { increment: hours } },
+    });
+
+    return entry;
+  }
+}
+```
+
+
+---
+
+## Componentes Frontend Avanzados
+
+### DataTable Reutilizable con Filtros, Paginación y Exportación
+
+```tsx
+// apps/frontend/components/ui/data-table.tsx
+'use client';
+import { useState, useMemo } from 'react';
+import { flexRender, getCoreRowModel, getFilteredRowModel, getPaginationRowModel, getSortedRowModel, useReactTable, ColumnDef, SortingState } from '@tanstack/react-table';
+import { ChevronUp, ChevronDown, Download, Search, ChevronLeft, ChevronRight } from 'lucide-react';
+import * as XLSX from 'xlsx';
+
+interface DataTableProps<T> {
+  columns: ColumnDef<T>[];
+  data: T[];
+  searchable?: boolean;
+  exportable?: boolean;
+  exportFileName?: string;
+  pageSize?: number;
+}
+
+export function DataTable<T>({ columns, data, searchable = true, exportable = true, exportFileName = 'export', pageSize = 20 }: DataTableProps<T>) {
+  const [globalFilter, setGlobalFilter] = useState('');
+  const [sorting, setSorting] = useState<SortingState>([]);
+
+  const table = useReactTable({
+    data,
+    columns,
+    state: { globalFilter, sorting },
+    onGlobalFilterChange: setGlobalFilter,
+    onSortingChange: setSorting,
+    getCoreRowModel: getCoreRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    initialState: { pagination: { pageSize } },
+  });
+
+  const exportToExcel = () => {
+    const exportData = table.getFilteredRowModel().rows.map(row =>
+      row.getAllCells().reduce((acc, cell) => {
+        const header = typeof cell.column.columnDef.header === 'string' ? cell.column.columnDef.header : cell.column.id;
+        acc[header] = cell.getValue();
+        return acc;
+      }, {} as Record<string, any>)
+    );
+    const ws = XLSX.utils.json_to_sheet(exportData);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Datos');
+    XLSX.writeFile(wb, `${exportFileName}-${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        {searchable && (
+          <div className="relative flex-1 max-w-sm">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+            <input value={globalFilter} onChange={e => setGlobalFilter(e.target.value)}
+              placeholder="Buscar..." className="w-full pl-9 pr-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+          </div>
+        )}
+        {exportable && (
+          <button onClick={exportToExcel} className="flex items-center gap-2 px-3 py-2 border rounded-lg text-sm hover:bg-gray-50">
+            <Download className="w-4 h-4" /> Exportar
+          </button>
+        )}
+      </div>
+
+      <div className="border rounded-xl overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 border-b">
+            {table.getHeaderGroups().map(hg => (
+              <tr key={hg.id}>
+                {hg.headers.map(header => (
+                  <th key={header.id} className="px-4 py-3 text-left font-semibold text-gray-600 cursor-pointer select-none"
+                    onClick={header.column.getToggleSortingHandler()}>
+                    <div className="flex items-center gap-1">
+                      {flexRender(header.column.columnDef.header, header.getContext())}
+                      {header.column.getIsSorted() === 'asc' ? <ChevronUp className="w-3 h-3" /> :
+                       header.column.getIsSorted() === 'desc' ? <ChevronDown className="w-3 h-3" /> : null}
+                    </div>
+                  </th>
+                ))}
+              </tr>
+            ))}
+          </thead>
+          <tbody>
+            {table.getRowModel().rows.length === 0 ? (
+              <tr><td colSpan={columns.length} className="px-4 py-8 text-center text-gray-400">Sin resultados</td></tr>
+            ) : table.getRowModel().rows.map(row => (
+              <tr key={row.id} className="border-b hover:bg-gray-50 transition-colors">
+                {row.getVisibleCells().map(cell => (
+                  <td key={cell.id} className="px-4 py-3">
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex items-center justify-between text-sm text-gray-500">
+        <span>{table.getFilteredRowModel().rows.length} registros</span>
+        <div className="flex items-center gap-2">
+          <button onClick={() => table.previousPage()} disabled={!table.getCanPreviousPage()}
+            className="p-1 rounded hover:bg-gray-100 disabled:opacity-40"><ChevronLeft className="w-4 h-4" /></button>
+          <span>Página {table.getState().pagination.pageIndex + 1} de {table.getPageCount()}</span>
+          <button onClick={() => table.nextPage()} disabled={!table.getCanNextPage()}
+            className="p-1 rounded hover:bg-gray-100 disabled:opacity-40"><ChevronRight className="w-4 h-4" /></button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+### Formulario de Venta Completo
+
+```tsx
+// apps/frontend/app/(dashboard)/ventas/nueva/page.tsx
+'use client';
+import { useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { useMutation, useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import { formatCurrency } from '@/lib/utils';
+import { Plus, Trash2, Save, FileText } from 'lucide-react';
+import { useForm, useFieldArray } from 'react-hook-form';
+
+interface SaleFormData {
+  customerId: string;
+  paymentMethod: string;
+  dueDate?: string;
+  items: { productId: string; quantity: number; price: number; taxRate: number }[];
+}
+
+export default function NuevaVentaPage() {
+  const router = useRouter();
+  const { register, control, watch, handleSubmit, setValue, formState: { errors } } = useForm<SaleFormData>({
+    defaultValues: { items: [{ productId: '', quantity: 1, price: 0, taxRate: 0.16 }] },
+  });
+  const { fields, append, remove } = useFieldArray({ control, name: 'items' });
+  const items = watch('items');
+
+  const { data: customers } = useQuery({ queryKey: ['customers'], queryFn: () => api.get('/customers').then(r => r.data) });
+  const { data: products } = useQuery({ queryKey: ['products-all'], queryFn: () => api.get('/products?limit=500').then(r => r.data) });
+
+  const { mutate: createSale, isPending } = useMutation({
+    mutationFn: (data: SaleFormData) => api.post('/sales', data),
+    onSuccess: (res) => router.push(`/ventas/${res.data.id}`),
+  });
+
+  const subtotal = items.reduce((s, i) => s + (i.quantity || 0) * (i.price || 0), 0);
+  const tax = items.reduce((s, i) => s + (i.quantity || 0) * (i.price || 0) * (i.taxRate || 0), 0);
+  const total = subtotal + tax;
+
+  const handleProductChange = (index: number, productId: string) => {
+    const product = products?.data?.find((p: any) => p.id === productId);
+    if (product) {
+      setValue(`items.${index}.price`, product.price);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">Nueva Venta</h1>
+      </div>
+
+      <form onSubmit={handleSubmit(data => createSale(data))} className="space-y-6">
+        <div className="bg-white rounded-xl border p-6 space-y-4">
+          <h2 className="font-semibold text-gray-700">Datos del Cliente</h2>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="text-sm font-medium text-gray-600">Cliente *</label>
+              <select {...register('customerId', { required: true })}
+                className="w-full mt-1 border rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500">
+                <option value="">Seleccionar cliente...</option>
+                {customers?.data?.map((c: any) => <option key={c.id} value={c.id}>{c.businessName} - {c.rif}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-sm font-medium text-gray-600">Método de Pago</label>
+              <select {...register('paymentMethod')} className="w-full mt-1 border rounded-lg px-3 py-2 text-sm">
+                <option value="TRANSFERENCIA">Transferencia</option>
+                <option value="EFECTIVO">Efectivo</option>
+                <option value="ZELLE">Zelle</option>
+                <option value="CHEQUE">Cheque</option>
+                <option value="CREDITO">Crédito</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-gray-700">Productos</h2>
+            <button type="button" onClick={() => append({ productId: '', quantity: 1, price: 0, taxRate: 0.16 })}
+              className="flex items-center gap-1 text-sm text-indigo-600 hover:text-indigo-800">
+              <Plus className="w-4 h-4" /> Agregar línea
+            </button>
+          </div>
+
+          <div className="space-y-3">
+            {fields.map((field, index) => (
+              <div key={field.id} className="grid grid-cols-12 gap-2 items-end">
+                <div className="col-span-5">
+                  <label className="text-xs text-gray-500">Producto</label>
+                  <select {...register(`items.${index}.productId`, { required: true })}
+                    onChange={e => handleProductChange(index, e.target.value)}
+                    className="w-full border rounded-lg px-2 py-1.5 text-sm">
+                    <option value="">Seleccionar...</option>
+                    {products?.data?.map((p: any) => <option key={p.id} value={p.id}>{p.name} (Stock: {p.stock})</option>)}
+                  </select>
+                </div>
+                <div className="col-span-2">
+                  <label className="text-xs text-gray-500">Cantidad</label>
+                  <input type="number" step="0.01" {...register(`items.${index}.quantity`, { min: 0.01 })}
+                    className="w-full border rounded-lg px-2 py-1.5 text-sm" />
+                </div>
+                <div className="col-span-2">
+                  <label className="text-xs text-gray-500">Precio</label>
+                  <input type="number" step="0.01" {...register(`items.${index}.price`, { min: 0 })}
+                    className="w-full border rounded-lg px-2 py-1.5 text-sm" />
+                </div>
+                <div className="col-span-2">
+                  <label className="text-xs text-gray-500">IVA</label>
+                  <select {...register(`items.${index}.taxRate`)} className="w-full border rounded-lg px-2 py-1.5 text-sm">
+                    <option value={0.16}>16%</option>
+                    <option value={0.08}>8%</option>
+                    <option value={0}>Exento</option>
+                  </select>
+                </div>
+                <div className="col-span-1 flex justify-end">
+                  <button type="button" onClick={() => remove(index)} disabled={fields.length === 1}
+                    className="p-1.5 text-red-400 hover:text-red-600 disabled:opacity-30">
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border p-6">
+          <div className="flex justify-end">
+            <div className="w-64 space-y-2 text-sm">
+              <div className="flex justify-between"><span className="text-gray-500">Subtotal:</span><span>{formatCurrency(subtotal)}</span></div>
+              <div className="flex justify-between"><span className="text-gray-500">IVA:</span><span>{formatCurrency(tax)}</span></div>
+              <div className="flex justify-between font-bold text-base border-t pt-2"><span>Total:</span><span className="text-indigo-600">{formatCurrency(total)}</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex gap-3 justify-end">
+          <button type="button" onClick={() => router.back()} className="px-4 py-2 border rounded-lg text-sm hover:bg-gray-50">Cancelar</button>
+          <button type="submit" disabled={isPending}
+            className="flex items-center gap-2 px-6 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50">
+            <Save className="w-4 h-4" />
+            {isPending ? 'Guardando...' : 'Guardar Venta'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+```
+
+
+---
+
+## Flujos n8n Adicionales Avanzados
+
+### Flujo: Recordatorio de Facturas Vencidas
+
+```json
+{
+  "name": "Recordatorio Facturas Vencidas",
+  "nodes": [
+    {
+      "name": "Cron diario 9am",
+      "type": "n8n-nodes-base.cron",
+      "parameters": { "triggerTimes": { "item": [{ "hour": 9, "minute": 0 }] } }
+    },
+    {
+      "name": "Obtener facturas vencidas",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "url": "={{ $env.API_URL }}/receivables/overdue",
+        "authentication": "headerAuth"
+      }
+    },
+    {
+      "name": "Loop por cliente",
+      "type": "n8n-nodes-base.splitInBatches",
+      "parameters": { "batchSize": 1 }
+    },
+    {
+      "name": "Enviar recordatorio",
+      "type": "n8n-nodes-base.emailSend",
+      "parameters": {
+        "toEmail": "={{ $json.customer.email }}",
+        "subject": "Recordatorio de pago - Factura {{ $json.invoiceNumber }}",
+        "html": "<p>Estimado {{ $json.customer.businessName }},</p><p>Le recordamos que tiene una factura vencida por <strong>Bs. {{ $json.balance }}</strong>.</p><p>Factura: {{ $json.invoiceNumber }} | Vencimiento: {{ $json.dueDate }}</p><p>Por favor, regularice su situación a la brevedad.</p>"
+      }
+    },
+    {
+      "name": "Registrar recordatorio enviado",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.API_URL }}/receivables/{{ $json.id }}/reminder-sent"
+      }
+    }
+  ]
+}
+```
+
+### Flujo: Generación Automática de Nómina con Aprobación
+
+```json
+{
+  "name": "Nómina Automática con Aprobación",
+  "nodes": [
+    {
+      "name": "Cron último día del mes",
+      "type": "n8n-nodes-base.cron",
+      "parameters": { "triggerTimes": { "item": [{ "hour": 8, "minute": 0, "dayOfMonth": "last" }] } }
+    },
+    {
+      "name": "Calcular nómina",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.API_URL }}/payroll/calculate",
+        "body": "={ \"period\": \"current_month\" }"
+      }
+    },
+    {
+      "name": "Enviar para aprobación",
+      "type": "n8n-nodes-base.emailSend",
+      "parameters": {
+        "toEmail": "={{ $env.HR_MANAGER_EMAIL }}",
+        "subject": "Nómina pendiente de aprobación - {{ $now.format('MMMM yyyy') }}",
+        "html": "<p>La nómina del mes está lista para revisión.</p><p>Total empleados: {{ $json.employeeCount }}</p><p>Total a pagar: Bs. {{ $json.total }}</p><p><a href='{{ $env.FRONTEND_URL }}/rrhh/nomina/{{ $json.payrollId }}'>Revisar y aprobar</a></p>"
+      }
+    },
+    {
+      "name": "Esperar aprobación (webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "parameters": { "path": "payroll-approved", "responseMode": "onReceived" }
+    },
+    {
+      "name": "Procesar nómina aprobada",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.API_URL }}/payroll/{{ $json.payrollId }}/process"
+      }
+    },
+    {
+      "name": "Generar recibos PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.API_URL }}/payroll/{{ $json.payrollId }}/generate-receipts"
+      }
+    },
+    {
+      "name": "Enviar recibos a empleados",
+      "type": "n8n-nodes-base.splitInBatches",
+      "parameters": { "batchSize": 1 }
+    },
+    {
+      "name": "Email recibo individual",
+      "type": "n8n-nodes-base.emailSend",
+      "parameters": {
+        "toEmail": "={{ $json.employee.email }}",
+        "subject": "Recibo de pago - {{ $now.format('MMMM yyyy') }}",
+        "attachments": "={{ $json.receiptUrl }}"
+      }
+    }
+  ]
+}
+```
+
+### Flujo: Sincronización de Tipo de Cambio + Revaluación de Inventario
+
+```json
+{
+  "name": "Revaluación Inventario USD",
+  "nodes": [
+    {
+      "name": "Cron semanal lunes",
+      "type": "n8n-nodes-base.cron",
+      "parameters": { "triggerTimes": { "item": [{ "hour": 7, "minute": 0, "weekday": 1 }] } }
+    },
+    {
+      "name": "Obtener tasa BCV",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": { "url": "https://ve.dolarapi.com/v1/dolares/oficial" }
+    },
+    {
+      "name": "Revaluar inventario",
+      "type": "n8n-nodes-base.httpRequest",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.API_URL }}/inventory/revalue",
+        "body": "={{ JSON.stringify({ rate: $json.promedio, currency: 'USD' }) }}"
+      }
+    },
+    {
+      "name": "Notificar contabilidad",
+      "type": "n8n-nodes-base.emailSend",
+      "parameters": {
+        "toEmail": "={{ $env.ACCOUNTING_EMAIL }}",
+        "subject": "Revaluación de inventario completada",
+        "text": "Se revaluó el inventario con tasa BCV: Bs. {{ $node['Obtener tasa BCV'].json.promedio }}/USD\nVariación en valor de inventario: Bs. {{ $json.variance }}"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Dependencias Completas del Proyecto
+
+### Backend (apps/backend/package.json)
+
+```json
+{
+  "name": "erp-backend",
+  "version": "1.0.0",
+  "dependencies": {
+    "@nestjs/common": "^10.0.0",
+    "@nestjs/core": "^10.0.0",
+    "@nestjs/jwt": "^10.0.0",
+    "@nestjs/passport": "^10.0.0",
+    "@nestjs/platform-express": "^10.0.0",
+    "@nestjs/throttler": "^5.0.0",
+    "@nestjs/websockets": "^10.0.0",
+    "@nestjs/platform-socket.io": "^10.0.0",
+    "@nestjs/bullmq": "^10.0.0",
+    "@nestjs/cache-manager": "^2.0.0",
+    "@nestjs-modules/ioredis": "^2.0.0",
+    "@prisma/client": "^5.0.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/s3-request-presigner": "^3.0.0",
+    "@google/generative-ai": "^0.1.0",
+    "bcrypt": "^5.1.0",
+    "bullmq": "^5.0.0",
+    "cache-manager": "^5.0.0",
+    "cache-manager-ioredis-yet": "^2.0.0",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.0",
+    "compression": "^1.7.4",
+    "date-fns": "^3.0.0",
+    "exceljs": "^4.4.0",
+    "helmet": "^7.0.0",
+    "ioredis": "^5.0.0",
+    "multer": "^1.4.5",
+    "passport": "^0.7.0",
+    "passport-jwt": "^4.0.1",
+    "pdfkit": "^0.14.0",
+    "reflect-metadata": "^0.1.13",
+    "rxjs": "^7.8.0",
+    "socket.io": "^4.7.0",
+    "speakeasy": "^2.0.0",
+    "xmlbuilder2": "^3.1.0"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^10.0.0",
+    "@nestjs/testing": "^10.0.0",
+    "@types/bcrypt": "^5.0.0",
+    "@types/compression": "^1.7.0",
+    "@types/multer": "^1.4.0",
+    "@types/pdfkit": "^0.13.0",
+    "@types/speakeasy": "^2.0.0",
+    "jest": "^29.0.0",
+    "prisma": "^5.0.0",
+    "supertest": "^6.0.0",
+    "ts-jest": "^29.0.0",
+    "typescript": "^5.0.0"
+  }
+}
+```
+
+### Frontend (apps/frontend/package.json)
+
+```json
+{
+  "name": "erp-frontend",
+  "version": "1.0.0",
+  "dependencies": {
+    "next": "^14.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "@tanstack/react-query": "^5.0.0",
+    "@tanstack/react-table": "^8.0.0",
+    "axios": "^1.6.0",
+    "date-fns": "^3.0.0",
+    "lucide-react": "^0.300.0",
+    "react-hook-form": "^7.0.0",
+    "recharts": "^2.10.0",
+    "socket.io-client": "^4.7.0",
+    "xlsx": "^0.18.5",
+    "zustand": "^4.4.0",
+    "clsx": "^2.0.0",
+    "tailwind-merge": "^2.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "autoprefixer": "^10.0.0",
+    "postcss": "^8.0.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.0.0"
+  }
+}
+```
+
+
+---
+
+## Módulo Configuración: Gestor de Tablas Avanzado (Schema Explorer)
+
+### Concepto
+
+El gestor de tablas lee el schema real de PostgreSQL usando `information_schema` y `pg_catalog`. Muestra todas las tablas, columnas visibles y ocultas, tipos, constraints, relaciones FK, índices y valores reales de cada tabla. Permite editar registros directamente desde la UI con validación de tipos.
+
+### Backend: Schema Inspector Service
+
+```typescript
+// apps/backend/src/modules/config/schema-inspector.service.ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+
+@Injectable()
+export class SchemaInspectorService {
+  constructor(private prisma: PrismaService) {}
+
+  // ─── Todas las tablas del schema público ─────────────────────────────────
+  async getAllTables(): Promise<TableMeta[]> {
+    const tables = await this.prisma.$queryRaw<any[]>`
+      SELECT
+        t.table_name,
+        obj_description(pgc.oid, 'pg_class') AS table_comment,
+        (SELECT COUNT(*) FROM information_schema.columns c
+         WHERE c.table_name = t.table_name AND c.table_schema = 'public') AS column_count,
+        pgc.reltuples::bigint AS estimated_rows
+      FROM information_schema.tables t
+      JOIN pg_class pgc ON pgc.relname = t.table_name
+      WHERE t.table_schema = 'public'
+        AND t.table_type = 'BASE TABLE'
+      ORDER BY t.table_name
+    `;
+    return tables;
+  }
+
+  // ─── Columnas completas de una tabla (visibles + ocultas) ────────────────
+  async getTableColumns(tableName: string): Promise<ColumnMeta[]> {
+    const columns = await this.prisma.$queryRaw<any[]>`
+      SELECT
+        c.column_name,
+        c.data_type,
+        c.udt_name,
+        c.character_maximum_length,
+        c.numeric_precision,
+        c.numeric_scale,
+        c.is_nullable,
+        c.column_default,
+        c.ordinal_position,
+        col_description(pgc.oid, c.ordinal_position) AS column_comment,
+        CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END AS is_primary_key,
+        CASE WHEN uq.column_name IS NOT NULL THEN true ELSE false END AS is_unique,
+        CASE WHEN fk.column_name IS NOT NULL THEN true ELSE false END AS is_foreign_key,
+        fk.foreign_table_name,
+        fk.foreign_column_name,
+        CASE WHEN idx.column_name IS NOT NULL THEN true ELSE false END AS is_indexed
+      FROM information_schema.columns c
+      JOIN pg_class pgc ON pgc.relname = ${tableName}
+      LEFT JOIN (
+        SELECT ku.column_name FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage ku ON tc.constraint_name = ku.constraint_name
+        WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = ${tableName}
+      ) pk ON pk.column_name = c.column_name
+      LEFT JOIN (
+        SELECT ku.column_name FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage ku ON tc.constraint_name = ku.constraint_name
+        WHERE tc.constraint_type = 'UNIQUE' AND tc.table_name = ${tableName}
+      ) uq ON uq.column_name = c.column_name
+      LEFT JOIN (
+        SELECT
+          kcu.column_name,
+          ccu.table_name AS foreign_table_name,
+          ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+        JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_name = ${tableName}
+      ) fk ON fk.column_name = c.column_name
+      LEFT JOIN (
+        SELECT a.attname AS column_name
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = pgc.oid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = pgc.oid AND NOT i.indisprimary
+      ) idx ON idx.column_name = c.column_name
+      WHERE c.table_name = ${tableName} AND c.table_schema = 'public'
+      ORDER BY c.ordinal_position
+    `;
+    return columns;
+  }
+
+  // ─── Datos reales de una tabla con paginación ────────────────────────────
+  async getTableData(tableName: string, page = 1, limit = 50, search?: string, orderBy?: string, orderDir: 'ASC' | 'DESC' = 'ASC') {
+    // Validar nombre de tabla para prevenir SQL injection
+    const validTables = await this.getAllTables();
+    const tableExists = validTables.some(t => t.table_name === tableName);
+    if (!tableExists) throw new Error(`Tabla '${tableName}' no existe`);
+
+    const offset = (page - 1) * limit;
+    const orderClause = orderBy ? `ORDER BY "${orderBy}" ${orderDir}` : 'ORDER BY 1';
+
+    const [data, countResult] = await Promise.all([
+      this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT * FROM "${tableName}" ${orderClause} LIMIT ${limit} OFFSET ${offset}`
+      ),
+      this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT COUNT(*) as total FROM "${tableName}"`
+      ),
+    ]);
+
+    return {
+      data,
+      total: parseInt(countResult[0].total),
+      page,
+      limit,
+      totalPages: Math.ceil(parseInt(countResult[0].total) / limit),
+    };
+  }
+
+  // ─── Actualizar un registro ───────────────────────────────────────────────
+  async updateRecord(tableName: string, id: string, updates: Record<string, any>) {
+    const validTables = await this.getAllTables();
+    if (!validTables.some(t => t.table_name === tableName)) throw new Error('Tabla no válida');
+
+    const setClauses = Object.keys(updates)
+      .filter(k => k !== 'id')
+      .map((k, i) => `"${k}" = $${i + 2}`)
+      .join(', ');
+    const values = [id, ...Object.values(updates).filter((_, i) => Object.keys(updates)[i] !== 'id')];
+
+    await this.prisma.$queryRawUnsafe(
+      `UPDATE "${tableName}" SET ${setClauses}, "updatedAt" = NOW() WHERE id = $1`,
+      ...values
+    );
+    return { success: true };
+  }
+
+  // ─── Diagrama de relaciones (ERD data) ───────────────────────────────────
+  async getERDData() {
+    const tables = await this.getAllTables();
+    const relations = await this.prisma.$queryRaw<any[]>`
+      SELECT
+        tc.table_name AS source_table,
+        kcu.column_name AS source_column,
+        ccu.table_name AS target_table,
+        ccu.column_name AS target_column,
+        tc.constraint_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage ccu
+        ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = 'public'
+      ORDER BY tc.table_name
+    `;
+
+    const tableColumns: Record<string, any[]> = {};
+    for (const t of tables) {
+      tableColumns[t.table_name] = await this.getTableColumns(t.table_name);
+    }
+
+    return { tables, relations, tableColumns };
+  }
+
+  // ─── Estadísticas reales de la BD ────────────────────────────────────────
+  async getDatabaseStats() {
+    const [dbSize, tableStats, indexStats, slowQueries] = await Promise.all([
+      this.prisma.$queryRaw<any[]>`
+        SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size,
+               pg_database_size(current_database()) AS db_size_bytes
+      `,
+      this.prisma.$queryRaw<any[]>`
+        SELECT
+          relname AS table_name,
+          n_live_tup AS live_rows,
+          n_dead_tup AS dead_rows,
+          pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+          pg_total_relation_size(relid) AS total_size_bytes,
+          last_vacuum,
+          last_autovacuum,
+          last_analyze
+        FROM pg_stat_user_tables
+        ORDER BY pg_total_relation_size(relid) DESC
+        LIMIT 20
+      `,
+      this.prisma.$queryRaw<any[]>`
+        SELECT
+          indexrelname AS index_name,
+          relname AS table_name,
+          idx_scan AS scans,
+          idx_tup_read AS tuples_read,
+          pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+        FROM pg_stat_user_indexes
+        ORDER BY idx_scan DESC
+        LIMIT 20
+      `,
+      this.prisma.$queryRaw<any[]>`
+        SELECT
+          query,
+          calls,
+          total_exec_time::numeric(10,2) AS total_ms,
+          mean_exec_time::numeric(10,2) AS avg_ms,
+          rows
+        FROM pg_stat_statements
+        WHERE query NOT LIKE '%pg_stat%'
+        ORDER BY mean_exec_time DESC
+        LIMIT 10
+      `.catch(() => []), // pg_stat_statements puede no estar habilitado
+    ]);
+
+    return { dbSize: dbSize[0], tableStats, indexStats, slowQueries };
+  }
+}
+
+interface TableMeta {
+  table_name: string;
+  table_comment: string | null;
+  column_count: number;
+  estimated_rows: number;
+}
+
+interface ColumnMeta {
+  column_name: string;
+  data_type: string;
+  udt_name: string;
+  is_nullable: string;
+  column_default: string | null;
+  is_primary_key: boolean;
+  is_unique: boolean;
+  is_foreign_key: boolean;
+  foreign_table_name: string | null;
+  foreign_column_name: string | null;
+  is_indexed: boolean;
+  column_comment: string | null;
+}
+```
+
+
+### Controller del Schema Inspector
+
+```typescript
+// apps/backend/src/modules/config/schema-inspector.controller.ts
+import { Controller, Get, Patch, Param, Body, Query, UseGuards } from '@nestjs/common';
+import { SchemaInspectorService } from './schema-inspector.service';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { PermissionsGuard } from '../../common/guards/permissions.guard';
+import { RequirePermissions } from '../../common/decorators/permissions.decorator';
+
+@Controller('config/schema')
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class SchemaInspectorController {
+  constructor(private schema: SchemaInspectorService) {}
+
+  @Get('tables')
+  @RequirePermissions('config:read')
+  getTables() {
+    return this.schema.getAllTables();
+  }
+
+  @Get('tables/:table/columns')
+  @RequirePermissions('config:read')
+  getColumns(@Param('table') table: string) {
+    return this.schema.getTableColumns(table);
+  }
+
+  @Get('tables/:table/data')
+  @RequirePermissions('config:read')
+  getData(
+    @Param('table') table: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '50',
+    @Query('orderBy') orderBy?: string,
+    @Query('orderDir') orderDir: 'ASC' | 'DESC' = 'ASC',
+  ) {
+    return this.schema.getTableData(table, +page, +limit, undefined, orderBy, orderDir);
+  }
+
+  @Patch('tables/:table/records/:id')
+  @RequirePermissions('config:write')
+  updateRecord(
+    @Param('table') table: string,
+    @Param('id') id: string,
+    @Body() updates: Record<string, any>,
+  ) {
+    return this.schema.updateRecord(table, id, updates);
+  }
+
+  @Get('erd')
+  @RequirePermissions('config:read')
+  getERD() {
+    return this.schema.getERDData();
+  }
+
+  @Get('stats')
+  @RequirePermissions('config:read')
+  getStats() {
+    return this.schema.getDatabaseStats();
+  }
+}
+```
+
+
+### Frontend: Página Gestor de Tablas (Configuración)
+
+```tsx
+// apps/frontend/app/(dashboard)/configuracion/tablas/page.tsx
+'use client';
+import { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { api } from '@/lib/api';
+import {
+  Database, Table2, Eye, EyeOff, Key, Link2,
+  Search, ChevronUp, ChevronDown, Edit2, Check, X,
+  BarChart3, RefreshCw
+} from 'lucide-react';
+
+export default function GestorTablasPage() {
+  const [selectedTable, setSelectedTable] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<'data' | 'columns' | 'stats'>('data');
+  const [page, setPage] = useState(1);
+  const [orderBy, setOrderBy] = useState<string>('');
+  const [orderDir, setOrderDir] = useState<'ASC' | 'DESC'>('ASC');
+  const [editingRow, setEditingRow] = useState<string | null>(null);
+  const [editValues, setEditValues] = useState<Record<string, any>>({});
+  const [tableSearch, setTableSearch] = useState('');
+  const qc = useQueryClient();
+
+  const { data: tables, isLoading: loadingTables } = useQuery({
+    queryKey: ['schema-tables'],
+    queryFn: () => api.get('/config/schema/tables').then(r => r.data),
+  });
+
+  const { data: columns } = useQuery({
+    queryKey: ['schema-columns', selectedTable],
+    queryFn: () => api.get(`/config/schema/tables/${selectedTable}/columns`).then(r => r.data),
+    enabled: !!selectedTable,
+  });
+
+  const { data: tableData, isLoading: loadingData } = useQuery({
+    queryKey: ['schema-data', selectedTable, page, orderBy, orderDir],
+    queryFn: () => api.get(`/config/schema/tables/${selectedTable}/data`, {
+      params: { page, limit: 50, orderBy: orderBy || undefined, orderDir },
+    }).then(r => r.data),
+    enabled: !!selectedTable && activeTab === 'data',
+  });
+
+  const { data: dbStats } = useQuery({
+    queryKey: ['db-stats'],
+    queryFn: () => api.get('/config/schema/stats').then(r => r.data),
+    enabled: activeTab === 'stats',
+  });
+
+  const { mutate: saveEdit } = useMutation({
+    mutationFn: ({ id, updates }: { id: string; updates: Record<string, any> }) =>
+      api.patch(`/config/schema/tables/${selectedTable}/records/${id}`, updates),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['schema-data', selectedTable] });
+      setEditingRow(null);
+      setEditValues({});
+    },
+  });
+
+  const filteredTables = tables?.filter((t: any) =>
+    t.table_name.toLowerCase().includes(tableSearch.toLowerCase())
+  ) ?? [];
+
+  const handleSort = (col: string) => {
+    if (orderBy === col) setOrderDir(d => d === 'ASC' ? 'DESC' : 'ASC');
+    else { setOrderBy(col); setOrderDir('ASC'); }
+    setPage(1);
+  };
+
+  const startEdit = (row: any) => {
+    setEditingRow(row.id);
+    setEditValues({ ...row });
+  };
+
+  const cancelEdit = () => { setEditingRow(null); setEditValues({}); };
+
+  const getColumnBadge = (col: any) => {
+    const badges = [];
+    if (col.is_primary_key) badges.push(<span key="pk" className="px-1.5 py-0.5 bg-yellow-100 text-yellow-700 rounded text-[10px] font-bold">PK</span>);
+    if (col.is_foreign_key) badges.push(<span key="fk" className="px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded text-[10px] font-bold">FK→{col.foreign_table_name}</span>);
+    if (col.is_unique) badges.push(<span key="uq" className="px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded text-[10px] font-bold">UQ</span>);
+    if (col.is_indexed) badges.push(<span key="idx" className="px-1.5 py-0.5 bg-green-100 text-green-700 rounded text-[10px] font-bold">IDX</span>);
+    if (col.is_nullable === 'NO' && !col.is_primary_key) badges.push(<span key="nn" className="px-1.5 py-0.5 bg-red-100 text-red-700 rounded text-[10px] font-bold">NOT NULL</span>);
+    return badges;
+  };
+
+  return (
+    <div className="flex h-[calc(100vh-4rem)] gap-0 bg-gray-50">
+      {/* ── Sidebar: lista de tablas ── */}
+      <aside className="w-64 bg-white border-r flex flex-col">
+        <div className="p-3 border-b">
+          <div className="flex items-center gap-2 mb-2">
+            <Database className="w-4 h-4 text-indigo-600" />
+            <span className="font-semibold text-sm">Base de Datos</span>
+          </div>
+          <div className="relative">
+            <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-gray-400" />
+            <input
+              value={tableSearch}
+              onChange={e => setTableSearch(e.target.value)}
+              placeholder="Buscar tabla..."
+              className="w-full pl-7 pr-2 py-1.5 text-xs border rounded-lg focus:ring-1 focus:ring-indigo-500"
+            />
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto py-1">
+          {loadingTables ? (
+            <div className="p-4 text-xs text-gray-400 text-center">Cargando...</div>
+          ) : filteredTables.map((t: any) => (
+            <button
+              key={t.table_name}
+              onClick={() => { setSelectedTable(t.table_name); setPage(1); setActiveTab('data'); }}
+              className={`w-full flex items-center justify-between px-3 py-2 text-xs hover:bg-gray-50 transition-colors ${
+                selectedTable === t.table_name ? 'bg-indigo-50 text-indigo-700 font-semibold border-r-2 border-indigo-600' : 'text-gray-700'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <Table2 className="w-3 h-3 flex-shrink-0" />
+                <span className="truncate">{t.table_name}</span>
+              </div>
+              <span className="text-[10px] text-gray-400 flex-shrink-0">
+                {Number(t.estimated_rows).toLocaleString()}
+              </span>
+            </button>
+          ))}
+        </div>
+        {/* Stats rápidas */}
+        <div className="p-3 border-t bg-gray-50 text-xs text-gray-500 space-y-1">
+          <div className="flex justify-between">
+            <span>Tablas:</span>
+            <span className="font-medium">{tables?.length ?? 0}</span>
+          </div>
+        </div>
+      </aside>
+
+      {/* ── Panel principal ── */}
+      <div className="flex-1 flex flex-col overflow-hidden">
+        {!selectedTable ? (
+          <div className="flex-1 flex items-center justify-center text-gray-400">
+            <div className="text-center">
+              <Database className="w-12 h-12 mx-auto mb-3 opacity-30" />
+              <p className="text-sm">Selecciona una tabla para explorar</p>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Header */}
+            <div className="bg-white border-b px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Table2 className="w-5 h-5 text-indigo-600" />
+                <h2 className="font-bold text-gray-800">{selectedTable}</h2>
+                {tableData && (
+                  <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">
+                    {tableData.total.toLocaleString()} registros
+                  </span>
+                )}
+              </div>
+              <div className="flex gap-1">
+                {(['data', 'columns', 'stats'] as const).map(tab => (
+                  <button
+                    key={tab}
+                    onClick={() => setActiveTab(tab)}
+                    className={`px-3 py-1.5 text-xs rounded-lg font-medium transition-colors ${
+                      activeTab === tab ? 'bg-indigo-600 text-white' : 'text-gray-600 hover:bg-gray-100'
+                    }`}
+                  >
+                    {tab === 'data' ? 'Datos' : tab === 'columns' ? 'Columnas' : 'Estadísticas'}
+                  </button>
+                ))}
+                <button
+                  onClick={() => qc.invalidateQueries({ queryKey: ['schema-data', selectedTable] })}
+                  className="p-1.5 text-gray-500 hover:bg-gray-100 rounded-lg"
+                  title="Refrescar"
+                >
+                  <RefreshCw className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* ── Tab: Columnas ── */}
+            {activeTab === 'columns' && (
+              <div className="flex-1 overflow-auto p-4">
+                <div className="bg-white rounded-xl border overflow-hidden">
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 border-b">
+                      <tr>
+                        {['#', 'Columna', 'Tipo', 'Nullable', 'Default', 'Atributos', 'Referencia'].map(h => (
+                          <th key={h} className="px-3 py-2.5 text-left font-semibold text-gray-600">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {columns?.map((col: any) => (
+                        <tr key={col.column_name} className="border-b hover:bg-gray-50">
+                          <td className="px-3 py-2 text-gray-400">{col.ordinal_position}</td>
+                          <td className="px-3 py-2 font-mono font-semibold text-gray-800">
+                            <div className="flex items-center gap-1">
+                              {col.is_primary_key && <Key className="w-3 h-3 text-yellow-500" />}
+                              {col.is_foreign_key && <Link2 className="w-3 h-3 text-blue-500" />}
+                              {col.column_name}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 font-mono text-indigo-600">
+                            {col.udt_name}
+                            {col.character_maximum_length ? `(${col.character_maximum_length})` : ''}
+                          </td>
+                          <td className="px-3 py-2">
+                            {col.is_nullable === 'YES'
+                              ? <Eye className="w-3.5 h-3.5 text-green-500" />
+                              : <EyeOff className="w-3.5 h-3.5 text-red-400" />}
+                          </td>
+                          <td className="px-3 py-2 font-mono text-gray-500 max-w-[120px] truncate">
+                            {col.column_default ?? '—'}
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="flex flex-wrap gap-1">{getColumnBadge(col)}</div>
+                          </td>
+                          <td className="px-3 py-2 text-blue-600 font-mono text-[10px]">
+                            {col.is_foreign_key ? `${col.foreign_table_name}.${col.foreign_column_name}` : '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* ── Tab: Datos ── */}
+            {activeTab === 'data' && (
+              <div className="flex-1 overflow-auto">
+                {loadingData ? (
+                  <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Cargando datos...</div>
+                ) : tableData?.data?.length === 0 ? (
+                  <div className="flex items-center justify-center h-32 text-gray-400 text-sm">Tabla vacía</div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs border-collapse">
+                      <thead className="bg-gray-50 sticky top-0 z-10">
+                        <tr>
+                          <th className="px-3 py-2.5 text-left font-semibold text-gray-500 border-b w-16">Acc.</th>
+                          {tableData?.data?.[0] && Object.keys(tableData.data[0]).map(col => (
+                            <th
+                              key={col}
+                              className="px-3 py-2.5 text-left font-semibold text-gray-600 border-b cursor-pointer hover:bg-gray-100 whitespace-nowrap"
+                              onClick={() => handleSort(col)}
+                            >
+                              <div className="flex items-center gap-1">
+                                {col}
+                                {orderBy === col && (
+                                  orderDir === 'ASC'
+                                    ? <ChevronUp className="w-3 h-3 text-indigo-500" />
+                                    : <ChevronDown className="w-3 h-3 text-indigo-500" />
+                                )}
+                              </div>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {tableData?.data?.map((row: any) => (
+                          <tr key={row.id} className="border-b hover:bg-indigo-50/30 group">
+                            <td className="px-3 py-1.5">
+                              {editingRow === row.id ? (
+                                <div className="flex gap-1">
+                                  <button onClick={() => saveEdit({ id: row.id, updates: editValues })}
+                                    className="p-1 bg-green-500 text-white rounded hover:bg-green-600">
+                                    <Check className="w-3 h-3" />
+                                  </button>
+                                  <button onClick={cancelEdit}
+                                    className="p-1 bg-gray-300 text-gray-700 rounded hover:bg-gray-400">
+                                    <X className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              ) : (
+                                <button onClick={() => startEdit(row)}
+                                  className="p-1 text-gray-400 hover:text-indigo-600 opacity-0 group-hover:opacity-100 transition-opacity">
+                                  <Edit2 className="w-3 h-3" />
+                                </button>
+                              )}
+                            </td>
+                            {Object.entries(row).map(([col, val]) => (
+                              <td key={col} className="px-3 py-1.5 max-w-[200px]">
+                                {editingRow === row.id && col !== 'id' && col !== 'createdAt' && col !== 'updatedAt' ? (
+                                  <input
+                                    value={editValues[col] ?? ''}
+                                    onChange={e => setEditValues(prev => ({ ...prev, [col]: e.target.value }))}
+                                    className="w-full border border-indigo-300 rounded px-1.5 py-0.5 text-xs focus:ring-1 focus:ring-indigo-500 bg-white"
+                                  />
+                                ) : (
+                                  <span className={`block truncate font-mono ${
+                                    val === null ? 'text-gray-300 italic' :
+                                    typeof val === 'boolean' ? (val ? 'text-green-600' : 'text-red-400') :
+                                    col === 'id' ? 'text-gray-400 text-[10px]' : 'text-gray-800'
+                                  }`}>
+                                    {val === null ? 'null' :
+                                     typeof val === 'boolean' ? (val ? 'true' : 'false') :
+                                     val instanceof Date || (typeof val === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(val))
+                                       ? new Date(val as string).toLocaleString('es-VE')
+                                       : String(val)}
+                                  </span>
+                                )}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {/* Paginación */}
+                {tableData && tableData.totalPages > 1 && (
+                  <div className="flex items-center justify-between px-4 py-3 bg-white border-t text-xs text-gray-500">
+                    <span>{((page - 1) * 50) + 1}–{Math.min(page * 50, tableData.total)} de {tableData.total.toLocaleString()}</span>
+                    <div className="flex gap-1">
+                      <button onClick={() => setPage(1)} disabled={page === 1} className="px-2 py-1 border rounded disabled:opacity-40 hover:bg-gray-50">«</button>
+                      <button onClick={() => setPage(p => p - 1)} disabled={page === 1} className="px-2 py-1 border rounded disabled:opacity-40 hover:bg-gray-50">‹</button>
+                      <span className="px-3 py-1 bg-indigo-600 text-white rounded">{page}</span>
+                      <button onClick={() => setPage(p => p + 1)} disabled={page === tableData.totalPages} className="px-2 py-1 border rounded disabled:opacity-40 hover:bg-gray-50">›</button>
+                      <button onClick={() => setPage(tableData.totalPages)} disabled={page === tableData.totalPages} className="px-2 py-1 border rounded disabled:opacity-40 hover:bg-gray-50">»</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── Tab: Estadísticas ── */}
+            {activeTab === 'stats' && dbStats && (
+              <div className="flex-1 overflow-auto p-4 space-y-4">
+                <div className="grid grid-cols-3 gap-4">
+                  <div className="bg-white rounded-xl border p-4">
+                    <p className="text-xs text-gray-500">Tamaño total BD</p>
+                    <p className="text-2xl font-bold text-indigo-600">{dbStats.dbSize?.db_size}</p>
+                  </div>
+                  <div className="bg-white rounded-xl border p-4">
+                    <p className="text-xs text-gray-500">Tablas</p>
+                    <p className="text-2xl font-bold text-gray-800">{tables?.length}</p>
+                  </div>
+                  <div className="bg-white rounded-xl border p-4">
+                    <p className="text-xs text-gray-500">Tabla seleccionada</p>
+                    <p className="text-2xl font-bold text-gray-800">
+                      {dbStats.tableStats?.find((t: any) => t.table_name === selectedTable)?.live_rows?.toLocaleString() ?? '—'}
+                      <span className="text-sm font-normal text-gray-400 ml-1">filas</span>
+                    </p>
+                  </div>
+                </div>
+                <div className="bg-white rounded-xl border overflow-hidden">
+                  <div className="px-4 py-3 border-b flex items-center gap-2">
+                    <BarChart3 className="w-4 h-4 text-indigo-600" />
+                    <span className="font-semibold text-sm">Tablas por tamaño</span>
+                  </div>
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 border-b">
+                      <tr>
+                        {['Tabla', 'Filas vivas', 'Filas muertas', 'Tamaño', 'Último vacuum'].map(h => (
+                          <th key={h} className="px-3 py-2 text-left font-semibold text-gray-600">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {dbStats.tableStats?.map((t: any) => (
+                        <tr key={t.table_name}
+                          className={`border-b hover:bg-gray-50 cursor-pointer ${t.table_name === selectedTable ? 'bg-indigo-50' : ''}`}
+                          onClick={() => { setSelectedTable(t.table_name); setActiveTab('data'); }}>
+                          <td className="px-3 py-2 font-mono font-semibold text-gray-800">{t.table_name}</td>
+                          <td className="px-3 py-2 text-green-600">{Number(t.live_rows).toLocaleString()}</td>
+                          <td className="px-3 py-2 text-red-400">{Number(t.dead_rows).toLocaleString()}</td>
+                          <td className="px-3 py-2 font-medium">{t.total_size}</td>
+                          <td className="px-3 py-2 text-gray-400">
+                            {t.last_autovacuum ? new Date(t.last_autovacuum).toLocaleString('es-VE') : '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+    "autoprefixer": "^10.0.0",
+    "postcss": "^8.0.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.0.0",
+    "reactflow": "^11.11.0"
+  }
+}
+```
+
+---
+
+## Diagrama ERD Visual Interactivo (ReactFlow)
+
+### Concepto
+
+El componente `ERDDiagram` consume el endpoint `/config/schema/erd` y renderiza un grafo interactivo con ReactFlow. Cada tabla es un nodo con sus columnas, y cada FK es una arista con flecha. Soporta zoom, pan y click para navegar a los datos de la tabla.
+
+### Componente ERD
+
+```tsx
+// apps/frontend/app/(dashboard)/configuracion/tablas/erd/page.tsx
+'use client';
+import { useCallback, useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import ReactFlow, {
+  Node, Edge, Background, Controls, MiniMap,
+  useNodesState, useEdgesState, MarkerType,
+  Handle, Position, NodeProps,
+} from 'reactflow';
+import 'reactflow/dist/style.css';
+import { api } from '@/lib/api';
+import { useRouter } from 'next/navigation';
+import { Key, Link2 } from 'lucide-react';
+
+// ── Nodo personalizado: tabla con columnas ────────────────────────────────
+function TableNode({ data, selected }: NodeProps) {
+  const router = useRouter();
+  return (
+    <div
+      className={`bg-white rounded-xl shadow-lg border-2 min-w-[200px] cursor-pointer transition-all ${
+        selected ? 'border-indigo-500 shadow-indigo-200' : 'border-gray-200 hover:border-indigo-300'
+      }`}
+      onDoubleClick={() => router.push(`/configuracion/tablas?table=${data.tableName}`)}
+    >
+      {/* Header */}
+      <div className="bg-indigo-600 text-white px-3 py-2 rounded-t-xl flex items-center justify-between">
+        <span className="font-bold text-xs">{data.tableName}</span>
+        <span className="text-[10px] opacity-70">{data.rowCount} rows</span>
+      </div>
+      {/* Columnas */}
+      <div className="divide-y divide-gray-100">
+        {data.columns?.slice(0, 8).map((col: any) => (
+          <div key={col.column_name} className="px-3 py-1 flex items-center justify-between gap-2">
+            <Handle
+              type="target"
+              position={Position.Left}
+              id={`${data.tableName}-${col.column_name}-target`}
+              style={{ opacity: 0, width: 6, height: 6 }}
+            />
+            <div className="flex items-center gap-1 min-w-0">
+              {col.is_primary_key && <Key className="w-2.5 h-2.5 text-yellow-500 flex-shrink-0" />}
+              {col.is_foreign_key && <Link2 className="w-2.5 h-2.5 text-blue-400 flex-shrink-0" />}
+              <span className={`text-[11px] truncate ${col.is_primary_key ? 'font-bold text-gray-800' : 'text-gray-600'}`}>
+                {col.column_name}
+              </span>
+            </div>
+            <span className="text-[10px] text-indigo-400 font-mono flex-shrink-0">{col.udt_name}</span>
+            <Handle
+              type="source"
+              position={Position.Right}
+              id={`${data.tableName}-${col.column_name}-source`}
+              style={{ opacity: 0, width: 6, height: 6 }}
+            />
+          </div>
+        ))}
+        {data.columns?.length > 8 && (
+          <div className="px-3 py-1 text-[10px] text-gray-400 italic">
+            +{data.columns.length - 8} más columnas...
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+```tsx
+const nodeTypes = { tableNode: TableNode };
+
+// ── Layout automático en grid ─────────────────────────────────────────────
+function buildLayout(tables: any[], tableColumns: Record<string, any[]>): Node[] {
+  const COLS = 5;
+  const COL_WIDTH = 260;
+  const ROW_HEIGHT = 320;
+  return tables.map((t: any, i: number) => ({
+    id: t.table_name,
+    type: 'tableNode',
+    position: {
+      x: (i % COLS) * COL_WIDTH + 40,
+      y: Math.floor(i / COLS) * ROW_HEIGHT + 40,
+    },
+    data: {
+      tableName: t.table_name,
+      rowCount: Number(t.estimated_rows).toLocaleString(),
+      columns: tableColumns[t.table_name] ?? [],
+    },
+  }));
+}
+
+function buildEdges(relations: any[]): Edge[] {
+  return relations.map((r: any, i: number) => ({
+    id: `e-${i}-${r.source_table}-${r.target_table}`,
+    source: r.source_table,
+    target: r.target_table,
+    sourceHandle: `${r.source_table}-${r.source_column}-source`,
+    targetHandle: `${r.target_table}-${r.target_column}-target`,
+    label: `${r.source_column} → ${r.target_column}`,
+    labelStyle: { fontSize: 9, fill: '#6366f1' },
+    labelBgStyle: { fill: '#eef2ff', fillOpacity: 0.9 },
+    markerEnd: { type: MarkerType.ArrowClosed, color: '#6366f1', width: 12, height: 12 },
+    style: { stroke: '#6366f1', strokeWidth: 1.5 },
+    animated: false,
+    type: 'smoothstep',
+  }));
+}
+
+export default function ERDPage() {
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+
+  const { data: erd, isLoading } = useQuery({
+    queryKey: ['erd-data'],
+    queryFn: () => api.get('/config/schema/erd').then(r => r.data),
+  });
+
+  useEffect(() => {
+    if (!erd) return;
+    setNodes(buildLayout(erd.tables, erd.tableColumns));
+    setEdges(buildEdges(erd.relations));
+  }, [erd]);
+
+  if (isLoading) return (
+    <div className="flex items-center justify-center h-screen text-gray-400">
+      <div className="text-center">
+        <div className="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
+        <p className="text-sm">Cargando diagrama de base de datos...</p>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="w-full h-[calc(100vh-4rem)] bg-gray-50">
+      <div className="absolute top-4 left-4 z-10 bg-white rounded-xl shadow-md px-4 py-2 text-xs text-gray-600 flex items-center gap-3">
+        <span className="font-semibold text-indigo-700">ERD — Base de Datos</span>
+        <span>{erd?.tables?.length ?? 0} tablas</span>
+        <span>{erd?.relations?.length ?? 0} relaciones FK</span>
+        <span className="text-gray-400">Doble click en tabla para ver datos</span>
+      </div>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodeTypes={nodeTypes}
+        fitView
+        fitViewOptions={{ padding: 0.1 }}
+        minZoom={0.1}
+        maxZoom={2}
+        attributionPosition="bottom-right"
+      >
+        <Background color="#e0e7ff" gap={20} size={1} />
+        <Controls className="bg-white shadow-md rounded-lg" />
+        <MiniMap
+          nodeColor={(n) => n.selected ? '#6366f1' : '#e0e7ff'}
+          maskColor="rgba(99,102,241,0.05)"
+          className="bg-white shadow-md rounded-lg"
+        />
+      </ReactFlow>
+    </div>
+  );
+}
+```
+
+---
+
+## Seed: Superusuario con Todos los Permisos
+
+```typescript
+// apps/backend/prisma/seed.ts
+import { PrismaClient } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
+
+const prisma = new PrismaClient();
+
+// ── Todos los módulos y acciones del sistema ──────────────────────────────
+const ALL_PERMISSIONS = [
+  // Ventas
+  { module: 'ventas', action: 'create' }, { module: 'ventas', action: 'read' },
+  { module: 'ventas', action: 'update' }, { module: 'ventas', action: 'delete' },
+  { module: 'ventas', action: 'approve' }, { module: 'ventas', action: 'invoice' },
+  { module: 'ventas', action: 'credit_note' }, { module: 'ventas', action: 'export' },
+  // Compras
+  { module: 'compras', action: 'create' }, { module: 'compras', action: 'read' },
+  { module: 'compras', action: 'update' }, { module: 'compras', action: 'delete' },
+  { module: 'compras', action: 'approve' }, { module: 'compras', action: 'receive' },
+  { module: 'compras', action: 'export' },
+  // Inventario
+  { module: 'inventario', action: 'create' }, { module: 'inventario', action: 'read' },
+  { module: 'inventario', action: 'update' }, { module: 'inventario', action: 'delete' },
+  { module: 'inventario', action: 'adjust' }, { module: 'inventario', action: 'transfer' },
+  { module: 'inventario', action: 'count' }, { module: 'inventario', action: 'export' },
+  // Contabilidad
+  { module: 'contabilidad', action: 'create' }, { module: 'contabilidad', action: 'read' },
+  { module: 'contabilidad', action: 'update' }, { module: 'contabilidad', action: 'delete' },
+  { module: 'contabilidad', action: 'close_period' }, { module: 'contabilidad', action: 'reopen_period' },
+  { module: 'contabilidad', action: 'export' }, { module: 'contabilidad', action: 'approve' },
+  // RRHH / Nómina
+  { module: 'rrhh', action: 'create' }, { module: 'rrhh', action: 'read' },
+  { module: 'rrhh', action: 'update' }, { module: 'rrhh', action: 'delete' },
+  { module: 'rrhh', action: 'process_payroll' }, { module: 'rrhh', action: 'approve_payroll' },
+  { module: 'rrhh', action: 'export' }, { module: 'rrhh', action: 'view_salary' },
+  // CRM
+  { module: 'crm', action: 'create' }, { module: 'crm', action: 'read' },
+  { module: 'crm', action: 'update' }, { module: 'crm', action: 'delete' },
+  { module: 'crm', action: 'export' }, { module: 'crm', action: 'campaigns' },
+  // Producción
+  { module: 'produccion', action: 'create' }, { module: 'produccion', action: 'read' },
+  { module: 'produccion', action: 'update' }, { module: 'produccion', action: 'delete' },
+  { module: 'produccion', action: 'approve' }, { module: 'produccion', action: 'export' },
+  // Proyectos
+  { module: 'proyectos', action: 'create' }, { module: 'proyectos', action: 'read' },
+  { module: 'proyectos', action: 'update' }, { module: 'proyectos', action: 'delete' },
+  { module: 'proyectos', action: 'approve' }, { module: 'proyectos', action: 'export' },
+  // Activos Fijos
+  { module: 'activos', action: 'create' }, { module: 'activos', action: 'read' },
+  { module: 'activos', action: 'update' }, { module: 'activos', action: 'delete' },
+  { module: 'activos', action: 'depreciate' }, { module: 'activos', action: 'retire' },
+  { module: 'activos', action: 'export' },
+  // Tesorería
+  { module: 'tesoreria', action: 'create' }, { module: 'tesoreria', action: 'read' },
+  { module: 'tesoreria', action: 'update' }, { module: 'tesoreria', action: 'delete' },
+  { module: 'tesoreria', action: 'approve' }, { module: 'tesoreria', action: 'reconcile' },
+  { module: 'tesoreria', action: 'export' },
+  // Presupuesto
+  { module: 'presupuesto', action: 'create' }, { module: 'presupuesto', action: 'read' },
+  { module: 'presupuesto', action: 'update' }, { module: 'presupuesto', action: 'delete' },
+  { module: 'presupuesto', action: 'approve' }, { module: 'presupuesto', action: 'export' },
+  // Calidad
+  { module: 'calidad', action: 'create' }, { module: 'calidad', action: 'read' },
+  { module: 'calidad', action: 'update' }, { module: 'calidad', action: 'delete' },
+  { module: 'calidad', action: 'approve' }, { module: 'calidad', action: 'export' },
+  // Mantenimiento
+  { module: 'mantenimiento', action: 'create' }, { module: 'mantenimiento', action: 'read' },
+  { module: 'mantenimiento', action: 'update' }, { module: 'mantenimiento', action: 'delete' },
+  { module: 'mantenimiento', action: 'approve' }, { module: 'mantenimiento', action: 'export' },
+  // POS
+  { module: 'pos', action: 'create' }, { module: 'pos', action: 'read' },
+  { module: 'pos', action: 'update' }, { module: 'pos', action: 'delete' },
+  { module: 'pos', action: 'close_shift' }, { module: 'pos', action: 'export' },
+  // Reportes
+  { module: 'reportes', action: 'read' }, { module: 'reportes', action: 'export' },
+  { module: 'reportes', action: 'schedule' }, { module: 'reportes', action: 'share' },
+  // Configuración
+  { module: 'config', action: 'read' }, { module: 'config', action: 'write' },
+  { module: 'config', action: 'schema_read' }, { module: 'config', action: 'schema_write' },
+  { module: 'config', action: 'users' }, { module: 'config', action: 'roles' },
+  { module: 'config', action: 'audit' }, { module: 'config', action: 'backup' },
+  // IA
+  { module: 'ai', action: 'read' }, { module: 'ai', action: 'use' },
+  { module: 'ai', action: 'train' }, { module: 'ai', action: 'export' },
+  // Importación
+  { module: 'importacion', action: 'create' }, { module: 'importacion', action: 'read' },
+  { module: 'importacion', action: 'delete' }, { module: 'importacion', action: 'export' },
+  // Documentos
+  { module: 'documentos', action: 'create' }, { module: 'documentos', action: 'read' },
+  { module: 'documentos', action: 'update' }, { module: 'documentos', action: 'delete' },
+  { module: 'documentos', action: 'share' },
+  // Notificaciones
+  { module: 'notificaciones', action: 'read' }, { module: 'notificaciones', action: 'manage' },
+  // Aprobaciones
+  { module: 'aprobaciones', action: 'read' }, { module: 'aprobaciones', action: 'approve' },
+  { module: 'aprobaciones', action: 'reject' }, { module: 'aprobaciones', action: 'manage' },
+];
+
+async function main() {
+  console.log('🌱 Iniciando seed del sistema ERP...');
+
+  // ── 1. Crear rol SUPERADMIN ───────────────────────────────────────────────
+  const superAdminRole = await prisma.role.upsert({
+    where: { name: 'SUPERADMIN' },
+    update: {},
+    create: {
+      name: 'SUPERADMIN',
+      permissions: {
+        create: ALL_PERMISSIONS,
+      },
+    },
+  });
+  console.log(`✅ Rol SUPERADMIN creado con ${ALL_PERMISSIONS.length} permisos`);
+
+  // ── 2. Crear roles estándar ───────────────────────────────────────────────
+  const standardRoles = [
+    { name: 'ADMIN', modules: ['ventas', 'compras', 'inventario', 'contabilidad', 'rrhh', 'reportes', 'config'] },
+    { name: 'CONTADOR', modules: ['contabilidad', 'reportes', 'tesoreria', 'presupuesto', 'activos'] },
+    { name: 'VENDEDOR', modules: ['ventas', 'crm', 'inventario', 'pos'] },
+    { name: 'ALMACENISTA', modules: ['inventario', 'compras'] },
+    { name: 'RRHH', modules: ['rrhh', 'reportes'] },
+    { name: 'GERENTE', modules: ['ventas', 'compras', 'inventario', 'contabilidad', 'rrhh', 'reportes', 'crm', 'proyectos'] },
+  ];
+
+  for (const r of standardRoles) {
+    const perms = ALL_PERMISSIONS.filter(p => r.modules.includes(p.module));
+    await prisma.role.upsert({
+      where: { name: r.name },
+      update: {},
+      create: {
+        name: r.name,
+        permissions: { create: perms },
+      },
+    });
+    console.log(`✅ Rol ${r.name} creado con ${perms.length} permisos`);
+  }
+
+  // ── 3. Crear superusuario ─────────────────────────────────────────────────
+  const passwordHash = await bcrypt.hash('Admin@ERP2024!', 12);
+  const superUser = await prisma.user.upsert({
+    where: { email: 'admin@erp.local' },
+    update: { passwordHash, roleId: superAdminRole.id, isActive: true },
+    create: {
+      email: 'admin@erp.local',
+      passwordHash,
+      name: 'Administrador del Sistema',
+      roleId: superAdminRole.id,
+      isActive: true,
+      mfaEnabled: false,
+    },
+  });
+  console.log(`✅ Superusuario creado: ${superUser.email}`);
+  console.log(`   Contraseña inicial: Admin@ERP2024!`);
+  console.log(`   ⚠️  CAMBIAR CONTRASEÑA EN PRIMER LOGIN`);
+
+  // ── 4. Datos maestros iniciales ───────────────────────────────────────────
+  // Plan de cuentas básico venezolano
+  const cuentas = [
+    { code: '1', name: 'ACTIVOS', type: 'ACTIVO', level: 1 },
+    { code: '1.01', name: 'ACTIVO CIRCULANTE', type: 'ACTIVO', level: 2 },
+    { code: '1.01.01', name: 'Caja', type: 'ACTIVO', level: 3 },
+    { code: '1.01.02', name: 'Bancos', type: 'ACTIVO', level: 3 },
+    { code: '1.01.03', name: 'Inventario de Mercancías', type: 'ACTIVO', level: 3 },
+    { code: '1.01.04', name: 'Cuentas por Cobrar Clientes', type: 'ACTIVO', level: 3 },
+    { code: '1.01.05', name: 'IVA Crédito Fiscal', type: 'ACTIVO', level: 3 },
+    { code: '1.02', name: 'ACTIVO NO CIRCULANTE', type: 'ACTIVO', level: 2 },
+    { code: '1.02.01', name: 'Muebles y Enseres', type: 'ACTIVO', level: 3 },
+    { code: '1.02.02', name: 'Equipos de Computación', type: 'ACTIVO', level: 3 },
+    { code: '1.02.03', name: 'Vehículos', type: 'ACTIVO', level: 3 },
+    { code: '1.02.04', name: 'Depreciación Acumulada', type: 'ACTIVO', level: 3 },
+    { code: '2', name: 'PASIVOS', type: 'PASIVO', level: 1 },
+    { code: '2.01', name: 'PASIVO CIRCULANTE', type: 'PASIVO', level: 2 },
+    { code: '2.01.01', name: 'Cuentas por Pagar Proveedores', type: 'PASIVO', level: 3 },
+    { code: '2.01.02', name: 'IVA Débito Fiscal', type: 'PASIVO', level: 3 },
+    { code: '2.01.03', name: 'Retenciones IVA por Pagar', type: 'PASIVO', level: 3 },
+    { code: '2.01.04', name: 'ISLR Retenido por Pagar', type: 'PASIVO', level: 3 },
+    { code: '2.01.05', name: 'Prestaciones Sociales por Pagar', type: 'PASIVO', level: 3 },
+    { code: '2.01.06', name: 'Sueldos y Salarios por Pagar', type: 'PASIVO', level: 3 },
+    { code: '2.01.07', name: 'IVA por Pagar (neto)', type: 'PASIVO', level: 3 },
+    { code: '3', name: 'PATRIMONIO', type: 'PATRIMONIO', level: 1 },
+    { code: '3.01', name: 'Capital Social', type: 'PATRIMONIO', level: 2 },
+    { code: '3.02', name: 'Utilidades Retenidas', type: 'PATRIMONIO', level: 2 },
+    { code: '3.03', name: 'Resultado del Ejercicio', type: 'PATRIMONIO', level: 2 },
+    { code: '4', name: 'INGRESOS', type: 'INGRESO', level: 1 },
+    { code: '4.01', name: 'INGRESOS OPERACIONALES', type: 'INGRESO', level: 2 },
+    { code: '4.01.01', name: 'Ventas de Mercancías', type: 'INGRESO', level: 3 },
+    { code: '4.01.02', name: 'Ventas de Servicios', type: 'INGRESO', level: 3 },
+    { code: '4.02', name: 'OTROS INGRESOS', type: 'INGRESO', level: 2 },
+    { code: '4.02.01', name: 'Intereses Ganados', type: 'INGRESO', level: 3 },
+    { code: '4.02.02', name: 'Diferencial Cambiario Ganado', type: 'INGRESO', level: 3 },
+    { code: '5', name: 'COSTOS Y GASTOS', type: 'GASTO', level: 1 },
+    { code: '5.01', name: 'COSTO DE VENTAS', type: 'GASTO', level: 2 },
+    { code: '5.01.01', name: 'Costo de Mercancías Vendidas', type: 'GASTO', level: 3 },
+    { code: '5.02', name: 'GASTOS OPERACIONALES', type: 'GASTO', level: 2 },
+    { code: '5.02.01', name: 'Sueldos y Salarios', type: 'GASTO', level: 3 },
+    { code: '5.02.02', name: 'Prestaciones Sociales', type: 'GASTO', level: 3 },
+    { code: '5.02.03', name: 'Utilidades', type: 'GASTO', level: 3 },
+    { code: '5.02.04', name: 'Vacaciones', type: 'GASTO', level: 3 },
+    { code: '5.02.05', name: 'Depreciación del Ejercicio', type: 'GASTO', level: 3 },
+    { code: '5.02.06', name: 'Alquileres', type: 'GASTO', level: 3 },
+    { code: '5.02.07', name: 'Servicios Públicos', type: 'GASTO', level: 3 },
+    { code: '5.02.08', name: 'Publicidad y Mercadeo', type: 'GASTO', level: 3 },
+    { code: '5.03', name: 'GASTOS FINANCIEROS', type: 'GASTO', level: 2 },
+    { code: '5.03.01', name: 'Intereses Bancarios', type: 'GASTO', level: 3 },
+    { code: '5.03.02', name: 'Diferencial Cambiario Perdido', type: 'GASTO', level: 3 },
+  ];
+
+  for (const cuenta of cuentas) {
+    await prisma.account.upsert({
+      where: { code: cuenta.code },
+      update: {},
+      create: cuenta,
+    });
+  }
+  console.log(`✅ Plan de cuentas venezolano creado: ${cuentas.length} cuentas`);
+
+  // ── 5. Configuración inicial del sistema ──────────────────────────────────
+  const configs = [
+    { key: 'company_name', value: 'Mi Empresa C.A.', group: 'empresa' },
+    { key: 'company_rif', value: 'J-00000000-0', group: 'empresa' },
+    { key: 'company_address', value: 'Caracas, Venezuela', group: 'empresa' },
+    { key: 'iva_rate', value: '16', group: 'impuestos' },
+    { key: 'iva_reduced_rate', value: '8', group: 'impuestos' },
+    { key: 'retention_iva_rate', value: '75', group: 'impuestos' },
+    { key: 'invoice_prefix', value: 'F', group: 'facturacion' },
+    { key: 'invoice_control_start', value: '00-00000001', group: 'facturacion' },
+    { key: 'currency_primary', value: 'VES', group: 'moneda' },
+    { key: 'currency_secondary', value: 'USD', group: 'moneda' },
+    { key: 'bcv_sync_enabled', value: 'true', group: 'moneda' },
+    { key: 'fiscal_year_start', value: '01-01', group: 'contabilidad' },
+    { key: 'payroll_frequency', value: 'QUINCENAL', group: 'rrhh' },
+    { key: 'min_wage_ves', value: '130', group: 'rrhh' },
+    { key: 'cestaticket_ves', value: '130', group: 'rrhh' },
+  ];
+
+  for (const cfg of configs) {
+    await prisma.systemConfig.upsert({
+      where: { key: cfg.key },
+      update: {},
+      create: cfg,
+    });
+  }
+  console.log(`✅ Configuración inicial del sistema creada: ${configs.length} parámetros`);
+
+  console.log('\n🎉 Seed completado exitosamente');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('  URL:      http://localhost:3001');
+  console.log('  Email:    admin@erp.local');
+  console.log('  Password: Admin@ERP2024!');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+}
+
+main()
+  .catch(e => { console.error(e); process.exit(1); })
+  .finally(() => prisma.$disconnect());
+```
+
+Para ejecutar el seed:
+```bash
+cd apps/backend
+npx prisma db push
+npx ts-node prisma/seed.ts
+```
+
+O añadir al `package.json`:
+```json
+{
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  }
+}
+```
+Y ejecutar: `npx prisma db seed`
+
+---
+
+## Módulo de Auditoría y Trazabilidad Completa
+
+### Interceptor Global de Auditoría (NestJS)
+
+```typescript
+// apps/backend/src/common/interceptors/audit.interceptor.ts
+import { Injectable, NestInterceptor, ExecutionContext, CallHandler } from '@nestjs/common';
+import { Observable, tap } from 'rxjs';
+import { AuditService } from '../../modules/audit/audit.service';
+import { Reflector } from '@nestjs/core';
+
+@Injectable()
+export class AuditInterceptor implements NestInterceptor {
+  constructor(private audit: AuditService, private reflector: Reflector) {}
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const req = context.switchToHttp().getRequest();
+    const { user, method, url, body, ip } = req;
+    const skipAudit = this.reflector.get<boolean>('skipAudit', context.getHandler());
+    if (skipAudit || !user) return next.handle();
+
+    const actionMap: Record<string, string> = {
+      POST: 'CREATE', PUT: 'UPDATE', PATCH: 'UPDATE', DELETE: 'DELETE', GET: 'READ',
+    };
+    const action = actionMap[method] ?? method;
+    const module = url.split('/')[2] ?? 'unknown';
+
+    return next.handle().pipe(
+      tap(async (response) => {
+        if (method !== 'GET') {
+          await this.audit.log(user.sub, action, module, response?.id, ip, body, response);
+        }
+      }),
+    );
+  }
+}
+```
+
+### Servicio de Auditoría
+
+```typescript
+// apps/backend/src/modules/audit/audit.service.ts
+@Injectable()
+export class AuditService {
+  constructor(private prisma: PrismaService) {}
+
+  async log(
+    userId: string,
+    action: string,
+    module: string,
+    entityId?: string,
+    ip?: string,
+    before?: any,
+    after?: any,
+  ) {
+    // Sanitizar datos sensibles antes de guardar
+    const sanitize = (obj: any) => {
+      if (!obj) return obj;
+      const sensitive = ['password', 'passwordHash', 'mfaSecret', 'token', 'refreshToken'];
+      const clean = { ...obj };
+      sensitive.forEach(k => { if (clean[k]) clean[k] = '[REDACTED]'; });
+      return clean;
+    };
+
+    await this.prisma.auditLog.create({
+      data: {
+        userId,
+        action,
+        module,
+        entityId,
+        ipAddress: ip,
+        before: before ? sanitize(before) : undefined,
+        after: after ? sanitize(after) : undefined,
+      },
+    });
+  }
+
+  async getAuditTrail(filters: {
+    userId?: string;
+    module?: string;
+    action?: string;
+    entityId?: string;
+    from?: Date;
+    to?: Date;
+    page?: number;
+    limit?: number;
+  }) {
+    const { page = 1, limit = 50, ...where } = filters;
+    const [data, total] = await Promise.all([
+      this.prisma.auditLog.findMany({
+        where: {
+          ...(where.userId && { userId: where.userId }),
+          ...(where.module && { module: where.module }),
+          ...(where.action && { action: where.action }),
+          ...(where.entityId && { entityId: where.entityId }),
+          ...(where.from || where.to ? {
+            createdAt: {
+              ...(where.from && { gte: where.from }),
+              ...(where.to && { lte: where.to }),
+            },
+          } : {}),
+        },
+        include: { user: { select: { name: true, email: true } } },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.auditLog.count({ where }),
+    ]);
+    return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
+  }
+}
+```
+
+---
+
+## Módulo de Notificaciones en Tiempo Real (WebSocket + SSE)
+
+### Gateway WebSocket
+
+```typescript
+// apps/backend/src/modules/notifications/notifications.gateway.ts
+import {
+  WebSocketGateway, WebSocketServer, SubscribeMessage,
+  OnGatewayConnection, OnGatewayDisconnect,
+} from '@nestjs/websockets';
+import { Server, Socket } from 'socket.io';
+import { JwtService } from '@nestjs/jwt';
+
+@WebSocketGateway({ cors: { origin: process.env.FRONTEND_URL }, namespace: '/notifications' })
+export class NotificationsGateway implements OnGatewayConnection, OnGatewayDisconnect {
+  @WebSocketServer() server: Server;
+  private userSockets = new Map<string, Set<string>>(); // userId -> socketIds
+
+  constructor(private jwt: JwtService) {}
+
+  async handleConnection(client: Socket) {
+    try {
+      const token = client.handshake.auth.token;
+      const payload = this.jwt.verify(token);
+      client.data.userId = payload.sub;
+      if (!this.userSockets.has(payload.sub)) this.userSockets.set(payload.sub, new Set());
+      this.userSockets.get(payload.sub)!.add(client.id);
+      client.join(`user:${payload.sub}`);
+    } catch {
+      client.disconnect();
+    }
+  }
+
+  handleDisconnect(client: Socket) {
+    const userId = client.data.userId;
+    if (userId) {
+      this.userSockets.get(userId)?.delete(client.id);
+    }
+  }
+
+  // Enviar notificación a usuario específico
+  notifyUser(userId: string, event: string, data: any) {
+    this.server.to(`user:${userId}`).emit(event, data);
+  }
+
+  // Broadcast a todos los usuarios conectados
+  broadcast(event: string, data: any) {
+    this.server.emit(event, data);
+  }
+
+  // Notificar a usuarios con un rol específico
+  notifyRole(role: string, event: string, data: any) {
+    this.server.to(`role:${role}`).emit(event, data);
+  }
+}
+```
+
+### Servicio de Notificaciones
+
+```typescript
+// apps/backend/src/modules/notifications/notifications.service.ts
+@Injectable()
+export class NotificationsService {
+  constructor(
+    private prisma: PrismaService,
+    private gateway: NotificationsGateway,
+  ) {}
+
+  async create(data: {
+    userId: string;
+    title: string;
+    message: string;
+    type: 'INFO' | 'WARNING' | 'ERROR' | 'SUCCESS';
+    module?: string;
+    entityId?: string;
+    actionUrl?: string;
+  }) {
+    const notification = await this.prisma.notification.create({ data });
+    // Enviar en tiempo real
+    this.gateway.notifyUser(data.userId, 'notification', notification);
+    return notification;
+  }
+
+  async markAsRead(id: string, userId: string) {
+    return this.prisma.notification.updateMany({
+      where: { id, userId },
+      data: { readAt: new Date() },
+    });
+  }
+
+  async markAllAsRead(userId: string) {
+    return this.prisma.notification.updateMany({
+      where: { userId, readAt: null },
+      data: { readAt: new Date() },
+    });
+  }
+
+  async getUnread(userId: string) {
+    return this.prisma.notification.findMany({
+      where: { userId, readAt: null },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    });
+  }
+
+  // Notificaciones automáticas del sistema
+  async notifyLowStock(productId: string, productName: string, stock: number, minStock: number) {
+    const managers = await this.prisma.user.findMany({
+      where: { role: { permissions: { some: { module: 'inventario', action: 'read' } } } },
+      select: { id: true },
+    });
+    for (const m of managers) {
+      await this.create({
+        userId: m.id,
+        title: 'Stock Bajo',
+        message: `${productName} tiene ${stock} unidades (mínimo: ${minStock})`,
+        type: 'WARNING',
+        module: 'inventario',
+        entityId: productId,
+        actionUrl: `/inventario/productos/${productId}`,
+      });
+    }
+  }
+
+  async notifyApprovalRequired(approverId: string, module: string, entityId: string, description: string) {
+    await this.create({
+      userId: approverId,
+      title: 'Aprobación Requerida',
+      message: description,
+      type: 'INFO',
+      module,
+      entityId,
+      actionUrl: `/aprobaciones/${module}/${entityId}`,
+    });
+  }
+}
+```
+
+---
+
+## Módulo de Reportes y Libros Legales
+
+### Servicio de Reportes
+
+```typescript
+// apps/backend/src/modules/reports/reports.service.ts
+import ExcelJS from 'exceljs';
+import PDFDocument from 'pdfkit';
+
+@Injectable()
+export class ReportsService {
+  constructor(private prisma: PrismaService) {}
+
+  // ── Libro de Ventas IVA ───────────────────────────────────────────────────
+  async generateSalesBook(month: number, year: number): Promise<Buffer> {
+    const start = new Date(year, month - 1, 1);
+    const end = new Date(year, month, 0, 23, 59, 59);
+
+    const sales = await this.prisma.sale.findMany({
+      where: { status: 'INVOICED', createdAt: { gte: start, lte: end } },
+      include: { customer: true, items: { include: { product: true } } },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet(`Libro Ventas ${month}-${year}`);
+
+    // Encabezados SENIAT
+    ws.mergeCells('A1:L1');
+    ws.getCell('A1').value = 'LIBRO DE VENTAS';
+    ws.getCell('A1').font = { bold: true, size: 14 };
+    ws.getCell('A1').alignment = { horizontal: 'center' };
+
+    ws.getRow(3).values = [
+      'N°', 'Fecha', 'N° Factura', 'N° Control', 'RIF Cliente', 'Razón Social',
+      'Base Imponible', 'IVA 16%', 'IVA 8%', 'Exento', 'Total', 'Retención IVA',
+    ];
+    ws.getRow(3).font = { bold: true };
+    ws.getRow(3).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E7FF' } };
+
+    let totalBase = 0, totalIva16 = 0, totalIva8 = 0, totalExento = 0, totalGeneral = 0;
+    sales.forEach((s, i) => {
+      const base = s.subtotal;
+      const iva16 = s.items.filter(it => it.taxRate === 0.16).reduce((a, it) => a + it.subtotal * 0.16, 0);
+      const iva8 = s.items.filter(it => it.taxRate === 0.08).reduce((a, it) => a + it.subtotal * 0.08, 0);
+      const exento = s.items.filter(it => it.taxRate === 0).reduce((a, it) => a + it.subtotal, 0);
+      totalBase += base; totalIva16 += iva16; totalIva8 += iva8; totalExento += exento; totalGeneral += s.total;
+
+      ws.addRow([
+        i + 1,
+        new Date(s.createdAt).toLocaleDateString('es-VE'),
+        s.invoiceNumber,
+        s.controlNumber ?? '',
+        s.customer.rif,
+        s.customer.businessName,
+        base.toFixed(2),
+        iva16.toFixed(2),
+        iva8.toFixed(2),
+        exento.toFixed(2),
+        s.total.toFixed(2),
+        (s.retentionAmount ?? 0).toFixed(2),
+      ]);
+    });
+
+    // Totales
+    const totalRow = ws.addRow(['', '', '', '', '', 'TOTALES',
+      totalBase.toFixed(2), totalIva16.toFixed(2), totalIva8.toFixed(2),
+      totalExento.toFixed(2), totalGeneral.toFixed(2), '']);
+    totalRow.font = { bold: true };
+    totalRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF3C7' } };
+
+    // Formato columnas
+    ws.columns = [
+      { width: 5 }, { width: 12 }, { width: 16 }, { width: 14 }, { width: 14 },
+      { width: 30 }, { width: 14 }, { width: 12 }, { width: 12 }, { width: 12 },
+      { width: 14 }, { width: 14 },
+    ];
+
+    const buffer = await wb.xlsx.writeBuffer();
+    return Buffer.from(buffer);
+  }
+
+  // ── Balance de Comprobación ───────────────────────────────────────────────
+  async generateTrialBalance(year: number, month: number): Promise<Buffer> {
+    const start = new Date(year, 0, 1);
+    const end = new Date(year, month, 0, 23, 59, 59);
+
+    const accounts = await this.prisma.account.findMany({
+      where: { level: 3 },
+      include: {
+        journalItems: {
+          where: { journalEntry: { date: { gte: start, lte: end } } },
+        },
+      },
+      orderBy: { code: 'asc' },
+    });
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Balance de Comprobación');
+
+    ws.mergeCells('A1:F1');
+    ws.getCell('A1').value = `BALANCE DE COMPROBACIÓN — ${month}/${year}`;
+    ws.getCell('A1').font = { bold: true, size: 13 };
+    ws.getCell('A1').alignment = { horizontal: 'center' };
+
+    ws.getRow(3).values = ['Código', 'Cuenta', 'Débitos', 'Créditos', 'Saldo Deudor', 'Saldo Acreedor'];
+    ws.getRow(3).font = { bold: true };
+    ws.getRow(3).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E7FF' } };
+
+    let totalDebits = 0, totalCredits = 0;
+    for (const acc of accounts) {
+      const debits = acc.journalItems.reduce((s, i) => s + i.debit, 0);
+      const credits = acc.journalItems.reduce((s, i) => s + i.credit, 0);
+      if (debits === 0 && credits === 0) continue;
+      const balance = debits - credits;
+      totalDebits += debits; totalCredits += credits;
+      ws.addRow([
+        acc.code, acc.name,
+        debits.toFixed(2), credits.toFixed(2),
+        balance > 0 ? balance.toFixed(2) : '',
+        balance < 0 ? Math.abs(balance).toFixed(2) : '',
+      ]);
+    }
+
+    const tr = ws.addRow(['', 'TOTALES', totalDebits.toFixed(2), totalCredits.toFixed(2), '', '']);
+    tr.font = { bold: true };
+    tr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFEF3C7' } };
+
+    ws.columns = [{ width: 10 }, { width: 35 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }];
+    const buffer = await wb.xlsx.writeBuffer();
+    return Buffer.from(buffer);
+  }
+}
+```
+
+---
+
+## Módulo de Workflow de Aprobaciones Multinivel
+
+### Modelo de Datos
+
+```prisma
+model ApprovalWorkflow {
+  id          String   @id @default(cuid())
+  name        String   // "Aprobación OC > 10000 USD"
+  module      String   // compras, ventas, tesoreria, rrhh
+  condition   Json     // { field: "total", operator: "gt", value: 10000, currency: "USD" }
+  steps       ApprovalStep[]
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+}
+
+model ApprovalStep {
+  id          String   @id @default(cuid())
+  workflowId  String
+  workflow    ApprovalWorkflow @relation(fields: [workflowId], references: [id])
+  order       Int
+  approverRoleId String
+  approverRole   Role @relation(fields: [approverRoleId], references: [id])
+  timeoutHours   Int  @default(48)
+  onTimeout      String @default("ESCALATE") // ESCALATE, AUTO_APPROVE, AUTO_REJECT
+}
+
+model ApprovalRequest {
+  id          String   @id @default(cuid())
+  workflowId  String
+  workflow    ApprovalWorkflow @relation(fields: [workflowId], references: [id])
+  module      String
+  entityId    String
+  entityData  Json     // snapshot del documento
+  requestedBy String
+  requester   User     @relation("requester", fields: [requestedBy], references: [id])
+  currentStep Int      @default(1)
+  status      ApprovalStatus @default(PENDING)
+  decisions   ApprovalDecision[]
+  createdAt   DateTime @default(now())
+  resolvedAt  DateTime?
+}
+
+model ApprovalDecision {
+  id          String   @id @default(cuid())
+  requestId   String
+  request     ApprovalRequest @relation(fields: [requestId], references: [id])
+  step        Int
+  approverId  String
+  approver    User     @relation(fields: [approverId], references: [id])
+  decision    String   // APPROVED, REJECTED, RETURNED
+  comment     String?
+  createdAt   DateTime @default(now())
+}
+
+enum ApprovalStatus { PENDING APPROVED REJECTED RETURNED CANCELLED }
+```
+
+### Servicio de Aprobaciones
+
+```typescript
+// apps/backend/src/modules/approvals/approvals.service.ts
+@Injectable()
+export class ApprovalsService {
+  constructor(
+    private prisma: PrismaService,
+    private notifications: NotificationsService,
+  ) {}
+
+  async submitForApproval(module: string, entityId: string, entityData: any, requestedBy: string) {
+    // Buscar workflow aplicable
+    const workflows = await this.prisma.approvalWorkflow.findMany({
+      where: { module, isActive: true },
+      include: { steps: { include: { approverRole: { include: { users: true } } }, orderBy: { order: 'asc' } } },
+    });
+
+    const applicable = workflows.find(w => this.evaluateCondition(w.condition as any, entityData));
+    if (!applicable) return null; // No requiere aprobación
+
+    const request = await this.prisma.approvalRequest.create({
+      data: {
+        workflowId: applicable.id,
+        module,
+        entityId,
+        entityData,
+        requestedBy,
+        currentStep: 1,
+        status: 'PENDING',
+      },
+    });
+
+    // Notificar a los aprobadores del paso 1
+    const step1 = applicable.steps[0];
+    for (const approver of step1.approverRole.users) {
+      await this.notifications.notifyApprovalRequired(
+        approver.id, module, entityId,
+        `Requiere aprobación: ${module} #${entityId.slice(-6)} por ${entityData.total} ${entityData.currency ?? 'VES'}`,
+      );
+    }
+
+    return request;
+  }
+
+  async decide(requestId: string, approverId: string, decision: 'APPROVED' | 'REJECTED' | 'RETURNED', comment?: string) {
+    const request = await this.prisma.approvalRequest.findUnique({
+      where: { id: requestId },
+      include: {
+        workflow: {
+          include: { steps: { include: { approverRole: { include: { users: true } } }, orderBy: { order: 'asc' } } },
+        },
+      },
+    });
+    if (!request || request.status !== 'PENDING') throw new BadRequestException('Solicitud no válida');
+
+    await this.prisma.approvalDecision.create({
+      data: { requestId, step: request.currentStep, approverId, decision, comment },
+    });
+
+    if (decision === 'REJECTED' || decision === 'RETURNED') {
+      await this.prisma.approvalRequest.update({
+        where: { id: requestId },
+        data: { status: decision === 'REJECTED' ? 'REJECTED' : 'RETURNED', resolvedAt: new Date() },
+      });
+      // Notificar al solicitante
+      await this.notifications.create({
+        userId: request.requestedBy,
+        title: decision === 'REJECTED' ? 'Solicitud Rechazada' : 'Solicitud Devuelta',
+        message: comment ?? `Tu solicitud de ${request.module} fue ${decision === 'REJECTED' ? 'rechazada' : 'devuelta para corrección'}`,
+        type: decision === 'REJECTED' ? 'ERROR' : 'WARNING',
+        module: request.module,
+        entityId: request.entityId,
+      });
+      return;
+    }
+
+    // APPROVED: avanzar al siguiente paso o finalizar
+    const nextStep = request.workflow.steps.find(s => s.order === request.currentStep + 1);
+    if (nextStep) {
+      await this.prisma.approvalRequest.update({
+        where: { id: requestId },
+        data: { currentStep: request.currentStep + 1 },
+      });
+      for (const approver of nextStep.approverRole.users) {
+        await this.notifications.notifyApprovalRequired(
+          approver.id, request.module, request.entityId,
+          `Paso ${nextStep.order}: Requiere tu aprobación`,
+        );
+      }
+    } else {
+      // Aprobación final
+      await this.prisma.approvalRequest.update({
+        where: { id: requestId },
+        data: { status: 'APPROVED', resolvedAt: new Date() },
+      });
+      await this.notifications.create({
+        userId: request.requestedBy,
+        title: 'Solicitud Aprobada',
+        message: `Tu solicitud de ${request.module} fue aprobada completamente`,
+        type: 'SUCCESS',
+        module: request.module,
+        entityId: request.entityId,
+      });
+    }
+  }
+
+  private evaluateCondition(condition: { field: string; operator: string; value: number }, data: any): boolean {
+    const val = data[condition.field];
+    if (val === undefined) return false;
+    switch (condition.operator) {
+      case 'gt': return val > condition.value;
+      case 'gte': return val >= condition.value;
+      case 'lt': return val < condition.value;
+      case 'lte': return val <= condition.value;
+      case 'eq': return val === condition.value;
+      default: return false;
+    }
+  }
+}
+```
+
+---
+
+## Módulo de Multimoneda con Sincronización BCV
+
+### Servicio de Tasas de Cambio
+
+```typescript
+// apps/backend/src/modules/currency/currency.service.ts
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PrismaService } from '../prisma/prisma.service';
+import axios from 'axios';
+
+@Injectable()
+export class CurrencyService {
+  private readonly logger = new Logger(CurrencyService.name);
+
+  constructor(private prisma: PrismaService) {}
+
+  // ── Sync automático con BCV cada día hábil a las 3pm ─────────────────────
+  @Cron('0 15 * * 1-5', { timeZone: 'America/Caracas' })
+  async syncBCVRates() {
+    try {
+      // El BCV publica tasas en su web. Se parsea el HTML oficial.
+      const response = await axios.get('https://www.bcv.org.ve/', {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        timeout: 10000,
+      });
+      const html = response.data as string;
+
+      // Extraer tasa USD del HTML del BCV
+      const usdMatch = html.match(/id="dolar"[\s\S]*?<strong>([\d,]+)<\/strong>/);
+      const eurMatch = html.match(/id="euro"[\s\S]*?<strong>([\d,]+)<\/strong>/);
+
+      if (usdMatch) {
+        const rate = parseFloat(usdMatch[1].replace(',', '.'));
+        await this.saveRate('USD', 'VES', rate, 'BCV');
+        this.logger.log(`BCV USD/VES: ${rate}`);
+      }
+      if (eurMatch) {
+        const rate = parseFloat(eurMatch[1].replace(',', '.'));
+        await this.saveRate('EUR', 'VES', rate, 'BCV');
+        this.logger.log(`BCV EUR/VES: ${rate}`);
+      }
+    } catch (err) {
+      this.logger.error('Error sincronizando tasas BCV:', err.message);
+    }
+  }
+
+  async saveRate(from: string, to: string, rate: number, source: string) {
+    return this.prisma.exchangeRate.create({
+      data: { fromCurrency: from, toCurrency: to, rate, source, date: new Date() },
+    });
+  }
+
+  async getCurrentRate(from: string, to: string): Promise<number> {
+    const rate = await this.prisma.exchangeRate.findFirst({
+      where: { fromCurrency: from, toCurrency: to },
+      orderBy: { date: 'desc' },
+    });
+    if (!rate) throw new Error(`No hay tasa disponible para ${from}/${to}`);
+    return rate.rate;
+  }
+
+  async convert(amount: number, from: string, to: string): Promise<number> {
+    if (from === to) return amount;
+    const rate = await this.getCurrentRate(from, to);
+    return amount * rate;
+  }
+
+  async getRateHistory(from: string, to: string, days: number = 30) {
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+    return this.prisma.exchangeRate.findMany({
+      where: { fromCurrency: from, toCurrency: to, date: { gte: since } },
+      orderBy: { date: 'asc' },
+    });
+  }
+
+  // Revaluación de saldos en moneda extranjera
+  async revaluateForeignBalances() {
+    const usdRate = await this.getCurrentRate('USD', 'VES');
+    const accounts = await this.prisma.bankAccount.findMany({
+      where: { currency: 'USD' },
+    });
+
+    const results = [];
+    for (const acc of accounts) {
+      const newBalanceVes = acc.balance * usdRate;
+      results.push({ account: acc.accountNumber, balanceUSD: acc.balance, balanceVES: newBalanceVes, rate: usdRate });
+    }
+    return results;
+  }
+}
+```
+
+---
+
+## Módulo de Importación Masiva con Validación
+
+### Servicio de Importación
+
+```typescript
+// apps/backend/src/modules/import/import.service.ts
+import ExcelJS from 'exceljs';
+import { parse } from 'csv-parse/sync';
+
+@Injectable()
+export class ImportService {
+  constructor(private prisma: PrismaService) {}
+
+  async importProducts(buffer: Buffer, mimeType: string): Promise<ImportResult> {
+    const rows = mimeType.includes('csv')
+      ? this.parseCSV(buffer)
+      : await this.parseExcel(buffer, 'Productos');
+
+    const errors: ImportError[] = [];
+    const created: any[] = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const rowNum = i + 2; // +2 por header y 0-index
+
+      // Validaciones
+      if (!row.code) { errors.push({ row: rowNum, field: 'code', message: 'Código requerido' }); continue; }
+      if (!row.name) { errors.push({ row: rowNum, field: 'name', message: 'Nombre requerido' }); continue; }
+      if (isNaN(parseFloat(row.price))) { errors.push({ row: rowNum, field: 'price', message: 'Precio inválido' }); continue; }
+
+      try {
+        const product = await this.prisma.product.upsert({
+          where: { code: row.code },
+          update: {
+            name: row.name,
+            price: parseFloat(row.price),
+            cost: parseFloat(row.cost ?? '0'),
+            taxRate: parseFloat(row.taxRate ?? '0.16'),
+          },
+          create: {
+            code: row.code,
+            name: row.name,
+            description: row.description ?? '',
+            price: parseFloat(row.price),
+            cost: parseFloat(row.cost ?? '0'),
+            taxRate: parseFloat(row.taxRate ?? '0.16'),
+            minStock: parseInt(row.minStock ?? '0'),
+            unit: row.unit ?? 'UND',
+          },
+        });
+        created.push(product);
+      } catch (err) {
+        errors.push({ row: rowNum, field: 'general', message: err.message });
+      }
+    }
+
+    return {
+      total: rows.length,
+      created: created.length,
+      errors: errors.length,
+      errorDetails: errors,
+    };
+  }
+
+  async importCustomers(buffer: Buffer, mimeType: string): Promise<ImportResult> {
+    const rows = mimeType.includes('csv')
+      ? this.parseCSV(buffer)
+      : await this.parseExcel(buffer, 'Clientes');
+
+    const errors: ImportError[] = [];
+    const created: any[] = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const rowNum = i + 2;
+      if (!row.rif) { errors.push({ row: rowNum, field: 'rif', message: 'RIF requerido' }); continue; }
+      if (!row.businessName) { errors.push({ row: rowNum, field: 'businessName', message: 'Razón social requerida' }); continue; }
+
+      try {
+        const customer = await this.prisma.customer.upsert({
+          where: { rif: row.rif },
+          update: { businessName: row.businessName, email: row.email, phone: row.phone, address: row.address },
+          create: {
+            rif: row.rif,
+            businessName: row.businessName,
+            email: row.email ?? '',
+            phone: row.phone ?? '',
+            address: row.address ?? '',
+            creditLimit: parseFloat(row.creditLimit ?? '0'),
+            paymentTermDays: parseInt(row.paymentTermDays ?? '30'),
+          },
+        });
+        created.push(customer);
+      } catch (err) {
+        errors.push({ row: rowNum, field: 'general', message: err.message });
+      }
+    }
+
+    return { total: rows.length, created: created.length, errors: errors.length, errorDetails: errors };
+  }
+
+  private parseCSV(buffer: Buffer): any[] {
+    return parse(buffer.toString(), { columns: true, skip_empty_lines: true, trim: true });
+  }
+
+  private async parseExcel(buffer: Buffer, sheetName: string): Promise<any[]> {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buffer);
+    const ws = wb.getWorksheet(sheetName) ?? wb.worksheets[0];
+    const rows: any[] = [];
+    const headers: string[] = [];
+    ws.eachRow((row, rowNum) => {
+      if (rowNum === 1) {
+        row.eachCell(cell => headers.push(String(cell.value ?? '').trim()));
+      } else {
+        const obj: any = {};
+        row.eachCell((cell, colNum) => { obj[headers[colNum - 1]] = cell.value; });
+        rows.push(obj);
+      }
+    });
+    return rows;
+  }
+
+  // Generar plantilla Excel para descarga
+  async generateTemplate(type: 'products' | 'customers' | 'employees'): Promise<Buffer> {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Plantilla');
+
+    const templates: Record<string, string[]> = {
+      products: ['code', 'name', 'description', 'price', 'cost', 'taxRate', 'minStock', 'unit', 'categoryCode'],
+      customers: ['rif', 'businessName', 'email', 'phone', 'address', 'creditLimit', 'paymentTermDays'],
+      employees: ['cedula', 'firstName', 'lastName', 'email', 'phone', 'position', 'department', 'salary', 'hireDate'],
+    };
+
+    const headers = templates[type];
+    ws.addRow(headers);
+    ws.getRow(1).font = { bold: true };
+    ws.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E7FF' } };
+    ws.columns = headers.map(() => ({ width: 20 }));
+
+    const buffer = await wb.xlsx.writeBuffer();
+    return Buffer.from(buffer);
+  }
+}
+
+interface ImportResult {
+  total: number;
+  created: number;
+  errors: number;
+  errorDetails: ImportError[];
+}
+
+interface ImportError {
+  row: number;
+  field: string;
+  message: string;
+}
+```
+
+---
+
+## Módulo de Seguridad Avanzada
+
+### Rate Limiting con Redis
+
+```typescript
+// apps/backend/src/common/guards/rate-limit.guard.ts
+import { Injectable, CanActivate, ExecutionContext, HttpException, HttpStatus } from '@nestjs/common';
+import { InjectRedis } from '@nestjs-modules/ioredis';
+import Redis from 'ioredis';
+
+@Injectable()
+export class RateLimitGuard implements CanActivate {
+  constructor(@InjectRedis() private redis: Redis) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const req = context.switchToHttp().getRequest();
+    const ip = req.ip;
+    const path = req.path;
+    const key = `rate:${ip}:${path}`;
+
+    const current = await this.redis.incr(key);
+    if (current === 1) await this.redis.expire(key, 60); // ventana de 1 minuto
+
+    const limit = path.includes('/auth/login') ? 5 : 100; // 5 intentos login, 100 general
+    if (current > limit) {
+      throw new HttpException(
+        { message: 'Demasiadas solicitudes. Intenta en 1 minuto.', retryAfter: 60 },
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+    return true;
+  }
+}
+```
+
+### Encriptación de Datos Sensibles (AES-256-GCM)
+
+```typescript
+// apps/backend/src/common/utils/encryption.util.ts
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
+
+const ALGORITHM = 'aes-256-gcm';
+const KEY = scryptSync(process.env.ENCRYPTION_KEY ?? 'default-key-change-in-prod', 'salt', 32);
+
+export function encrypt(text: string): string {
+  const iv = randomBytes(16);
+  const cipher = createCipheriv(ALGORITHM, KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+export function decrypt(encryptedText: string): string {
+  const [ivHex, tagHex, dataHex] = encryptedText.split(':');
+  const iv = Buffer.from(ivHex, 'hex');
+  const tag = Buffer.from(tagHex, 'hex');
+  const data = Buffer.from(dataHex, 'hex');
+  const decipher = createDecipheriv(ALGORITHM, KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+}
+
+// Uso: encrypt('dato sensible') / decrypt(encrypted)
+// Aplicar en campos como: cuentas bancarias, RIF, datos de nómina
+```
+
+### Middleware de Seguridad (Helmet + CORS)
+
+```typescript
+// apps/backend/src/main.ts
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import helmet from 'helmet';
+import compression from 'compression';
+import { ValidationPipe } from '@nestjs/common';
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // Seguridad
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:', 'https:'],
+      },
+    },
+    hsts: { maxAge: 31536000, includeSubDomains: true },
+  }));
+
+  app.enableCors({
+    origin: process.env.FRONTEND_URL ?? 'http://localhost:3000',
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  });
+
+  app.use(compression());
+
+  app.useGlobalPipes(new ValidationPipe({
+    whitelist: true,        // elimina campos no declarados en DTO
+    forbidNonWhitelisted: true,
+    transform: true,
+    transformOptions: { enableImplicitConversion: true },
+  }));
+
+  app.setGlobalPrefix('api/v1');
+
+  await app.listen(process.env.PORT ?? 3001);
+  console.log(`🚀 ERP Backend corriendo en: http://localhost:${process.env.PORT ?? 3001}/api/v1`);
+}
+bootstrap();
+```
+
+---
+
+## Variables de Entorno Completas
+
+### Backend (.env)
+
+```env
+# Base de datos
+DATABASE_URL="postgresql://erp:erp@localhost:5432/erp"
+
+# JWT
+JWT_SECRET="tu-secreto-jwt-super-seguro-cambiar-en-produccion"
+JWT_REFRESH_SECRET="tu-secreto-refresh-super-seguro-cambiar-en-produccion"
+JWT_EXPIRES_IN="8h"
+
+# Redis
+REDIS_HOST="localhost"
+REDIS_PORT="6379"
+REDIS_PASSWORD=""
+
+# Encriptación
+ENCRYPTION_KEY="clave-encriptacion-32-chars-minimo"
+
+# Frontend
+FRONTEND_URL="http://localhost:3000"
+
+# Almacenamiento (Cloudflare R2 o AWS S3)
+S3_ENDPOINT="https://tu-account.r2.cloudflarestorage.com"
+S3_ACCESS_KEY="tu-access-key"
+S3_SECRET_KEY="tu-secret-key"
+S3_BUCKET="erp-documentos"
+S3_REGION="auto"
+
+# IA (opcional)
+GEMINI_API_KEY="tu-gemini-api-key"
+HUGGINGFACE_API_KEY="tu-hf-api-key"
+
+# n8n
+N8N_WEBHOOK_URL="http://localhost:5678/webhook"
+N8N_API_KEY="tu-n8n-api-key"
+
+# Email (para notificaciones)
+SMTP_HOST="smtp.gmail.com"
+SMTP_PORT="587"
+SMTP_USER="tu-email@gmail.com"
+SMTP_PASS="tu-app-password"
+SMTP_FROM="ERP Venezuela <noreply@tuempresa.com>"
+
+# Puerto
+PORT="3001"
+NODE_ENV="development"
+```
+
+### Frontend (.env.local)
+
+```env
+NEXT_PUBLIC_API_URL="http://localhost:3001/api/v1"
+NEXT_PUBLIC_WS_URL="http://localhost:3001"
+NEXT_PUBLIC_APP_NAME="ERP Venezuela"
+NEXT_PUBLIC_APP_VERSION="1.0.0"
+```
+
+---
+
+## Estructura Final del Proyecto
+
+```
+erp-venezuela/
+├── apps/
+│   ├── backend/                    # NestJS API
+│   │   ├── prisma/
+│   │   │   ├── schema.prisma       # Schema completo
+│   │   │   └── seed.ts             # Superusuario + datos iniciales
+│   │   ├── src/
+│   │   │   ├── modules/
+│   │   │   │   ├── auth/           # JWT, MFA, RBAC
+│   │   │   │   ├── users/          # Gestión usuarios
+│   │   │   │   ├── sales/          # Ventas, cotizaciones, facturas
+│   │   │   │   ├── purchases/      # Compras, OC, recepción
+│   │   │   │   ├── inventory/      # PEPS, conteo físico
+│   │   │   │   ├── accounting/     # Contabilidad, cierres
+│   │   │   │   ├── payroll/        # Nómina LOTTT
+│   │   │   │   ├── crm/            # CRM, leads, campañas
+│   │   │   │   ├── production/     # MRP II, órdenes
+│   │   │   │   ├── projects/       # Proyectos, Gantt
+│   │   │   │   ├── fixed-assets/   # Activos fijos, depreciación
+│   │   │   │   ├── treasury/       # Tesorería, flujo caja
+│   │   │   │   ├── budget/         # Presupuesto, centros costo
+│   │   │   │   ├── quality/        # Calidad, lotes, recall
+│   │   │   │   ├── maintenance/    # CMMS, órdenes trabajo
+│   │   │   │   ├── pos/            # Punto de venta
+│   │   │   │   ├── reports/        # Libros legales, Excel/PDF
+│   │   │   │   ├── notifications/  # WebSocket, push
+│   │   │   │   ├── approvals/      # Workflow aprobaciones
+│   │   │   │   ├── currency/       # Multimoneda, BCV sync
+│   │   │   │   ├── import/         # Importación masiva
+│   │   │   │   ├── audit/          # Auditoría completa
+│   │   │   │   ├── ai/             # IA, predicciones
+│   │   │   │   ├── documents/      # Gestión documentos
+│   │   │   │   └── config/         # Configuración, schema inspector
+│   │   │   ├── common/
+│   │   │   │   ├── guards/         # JWT, Permissions, RateLimit
+│   │   │   │   ├── interceptors/   # Audit, Transform
+│   │   │   │   ├── decorators/     # RequirePermissions, SkipAudit
+│   │   │   │   └── utils/          # Encryption, helpers
+│   │   │   └── main.ts
+│   │   └── package.json
+│   └── frontend/                   # Next.js 14 App Router
+│       ├── app/
+│       │   ├── (auth)/
+│       │   │   └── login/
+│       │   └── (dashboard)/
+│       │       ├── ventas/
+│       │       ├── compras/
+│       │       ├── inventario/
+│       │       ├── contabilidad/
+│       │       ├── rrhh/
+│       │       ├── crm/
+│       │       ├── produccion/
+│       │       ├── proyectos/
+│       │       ├── activos/
+│       │       ├── tesoreria/
+│       │       ├── presupuesto/
+│       │       ├── calidad/
+│       │       ├── mantenimiento/
+│       │       ├── pos/
+│       │       ├── reportes/
+│       │       ├── ai/
+│       │       └── configuracion/
+│       │           ├── tablas/     # Gestor de tablas
+│       │           └── tablas/erd/ # Diagrama ERD
+│       ├── components/
+│       │   ├── ui/                 # DataTable, Form, Modal...
+│       │   ├── layout/             # Sidebar, Header, Layout
+│       │   └── charts/             # Recharts wrappers
+│       ├── lib/
+│       │   ├── api.ts              # Axios con interceptores
+│       │   └── utils.ts
+│       ├── stores/                 # Zustand stores
+│       └── package.json
+├── packages/
+│   └── shared-types/               # Tipos TypeScript compartidos
+├── .github/
+│   └── workflows/
+│       └── ci.yml                  # CI/CD GitHub Actions
+├── docker-compose.yml
+└── README.md
+```
+
+---
+
+## Resumen de Credenciales Iniciales
+
+| Campo | Valor |
+|-------|-------|
+| URL Backend | http://localhost:3001/api/v1 |
+| URL Frontend | http://localhost:3000 |
+| Email superusuario | admin@erp.local |
+| Contraseña inicial | Admin@ERP2024! |
+| Rol | SUPERADMIN (todos los permisos) |
+| Permisos totales | 90+ acciones en 18 módulos |
+
+> ⚠️ Cambiar la contraseña en el primer inicio de sesión. Activar MFA para el superusuario en producción.
+
+---
+
+*Documento generado: ERP Venezuela — Blueprint Completo v2.0*
+*Tecnologías: NestJS + Prisma + PostgreSQL + Next.js 14 + TailwindCSS + ReactFlow + BullMQ + Redis + Socket.io*
