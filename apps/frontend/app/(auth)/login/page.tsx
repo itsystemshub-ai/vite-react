@@ -20,7 +20,8 @@ export default function LoginPage() {
       await login(email, password);
       router.push('/dashboard');
     } catch (err: any) {
-      setError(err.response?.data?.message ?? 'Error al iniciar sesión');
+      const msg = err.response?.data?.message ?? err.message ?? 'Error al iniciar sesión';
+      setError(Array.isArray(msg) ? msg.join(', ') : String(msg));
     } finally {
       setLoading(false);
     }

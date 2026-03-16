@@ -1,53 +1,55 @@
 # ERP Venezuela
 
-Sistema ERP profesional para Venezuela — NestJS + Next.js + PostgreSQL + Prisma
+Sistema ERP profesional para Venezuela — NestJS + Next.js + Neon PostgreSQL + Prisma
 
 ## Stack
 
-- **Backend**: NestJS 10, Prisma 5, PostgreSQL 15
+- **Backend**: NestJS 10, Prisma 5, Neon PostgreSQL (serverless)
 - **Frontend**: Next.js 14 (App Router), TailwindCSS, TanStack Query, Recharts
-- **Infraestructura**: Docker Compose (PostgreSQL + Redis + n8n)
+- **Base de datos**: Neon — PostgreSQL serverless gratuito (sin Docker)
 
 ## Inicio Rápido
 
-### 1. Levantar base de datos
+### 1. Crear base de datos en Neon (gratis, sin instalar nada)
+
+1. Ve a **https://neon.tech** y crea una cuenta gratuita
+2. Crea un nuevo proyecto (ej: `erp-venezuela`)
+3. En el dashboard copia la **Connection String** que tiene este formato:
+   ```
+   postgresql://usuario:password@ep-xxxx.us-east-2.aws.neon.tech/erp?sslmode=require
+   ```
+4. Pégala en `apps/backend/.env`:
+   ```env
+   DATABASE_URL="postgresql://usuario:password@ep-xxxx.us-east-2.aws.neon.tech/erp?sslmode=require"
+   ```
+
+### 2. Instalar dependencias
 
 ```bash
-docker-compose up -d postgres redis
-```
-
-### 2. Instalar dependencias del backend
-
-```bash
-cd apps/backend
+# Desde la raíz del proyecto
 npm install
 ```
 
-### 3. Generar cliente Prisma y crear tablas
+### 3. Crear tablas y ejecutar seed
 
 ```bash
-npx prisma generate
+cd apps/backend
 npx prisma db push
-```
-
-### 4. Ejecutar seed (superusuario + datos iniciales)
-
-```bash
 npx ts-node prisma/seed.ts
 ```
 
-### 5. Iniciar backend
+### 4. Iniciar backend
 
 ```bash
+# En apps/backend
 npm run dev
 # Corre en http://localhost:3001/api/v1
 ```
 
-### 6. Instalar dependencias del frontend (nueva terminal)
+### 5. Iniciar frontend (nueva terminal)
 
 ```bash
-cd apps/frontend
-npm install
+# En apps/frontend
 npm run dev
 # Corre en http://localhost:3000
 ```
@@ -63,6 +65,15 @@ npm run dev
 
 > Cambiar la contraseña en el primer login.
 
+## Servicios Gratuitos Usados
+
+| Servicio | Uso | URL |
+|----------|-----|-----|
+| Neon | PostgreSQL serverless | https://neon.tech |
+| Upstash | Redis serverless (opcional) | https://upstash.com |
+| Vercel | Deploy frontend (opcional) | https://vercel.com |
+| Railway | Deploy backend (opcional) | https://railway.app |
+
 ## Módulos Disponibles
 
 - Dashboard con KPIs y gráficos
@@ -75,7 +86,7 @@ npm run dev
 - Tesorería y Flujo de Caja
 - Activos Fijos con depreciación automática
 - Moneda / Tasas BCV con sync automático
-- Configuración + Gestor de Tablas + ERD
+- Configuración + Gestor de Tablas + ERD visual
 - Notificaciones en tiempo real
 
 ## Estructura
@@ -85,6 +96,5 @@ erp-venezuela/
 ├── apps/
 │   ├── backend/     # NestJS API (puerto 3001)
 │   └── frontend/    # Next.js 14 (puerto 3000)
-├── docker-compose.yml
 └── README.md
 ```
