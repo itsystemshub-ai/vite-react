@@ -30,11 +30,11 @@ export default function ConfiguracionPage() {
         </div>
       </div>
 
-      {groups.map(group => (
-        <div key={group} className="card">
+      {groups.map((group: any) => (
+        <div key={String(group)} className="card">
           <div className="p-4 border-b flex items-center gap-2">
             <Settings className="w-4 h-4 text-indigo-600" />
-            <h3 className="font-semibold capitalize">{group}</h3>
+            <h3 className="font-semibold capitalize">{String(group)}</h3>
           </div>
           <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
             {configs.filter((c: any) => c.group === group).map((c: any) => (

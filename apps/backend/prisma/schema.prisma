@@ -9,18 +9,95 @@ datasource db {
 
 // ─── ENUMS ────────────────────────────────────────────────────────────────────
 
-enum AccountType { ACTIVO PASIVO PATRIMONIO INGRESO GASTO }
-enum SaleStatus { DRAFT CONFIRMED INVOICED CANCELLED }
-enum PurchaseStatus { DRAFT CONFIRMED RECEIVED INVOICED CANCELLED }
-enum PaymentStatus { PENDING PARTIAL PAID OVERDUE }
-enum EmployeeStatus { ACTIVE INACTIVE SUSPENDED }
-enum AssetStatus { ACTIVO DADO_DE_BAJA EN_MANTENIMIENTO }
-enum DepreciationMethod { LINEAL ACELERADA UNIDADES_PRODUCCION }
-enum ApprovalStatus { PENDING APPROVED REJECTED RETURNED CANCELLED }
-enum TransactionType { DEPOSITO RETIRO TRANSFERENCIA CHEQUE NOTA_DEBITO NOTA_CREDITO }
-enum ProductionStatus { PLANNED IN_PROGRESS COMPLETED CANCELLED }
-enum LeadStatus { NEW CONTACTED QUALIFIED PROPOSAL NEGOTIATION WON LOST }
-enum ProjectStatus { PLANNING ACTIVE ON_HOLD COMPLETED CANCELLED }
+enum AccountType {
+  ACTIVO
+  PASIVO
+  PATRIMONIO
+  INGRESO
+  GASTO
+}
+
+enum SaleStatus {
+  DRAFT
+  CONFIRMED
+  INVOICED
+  CANCELLED
+}
+
+enum PurchaseStatus {
+  DRAFT
+  CONFIRMED
+  RECEIVED
+  INVOICED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  PARTIAL
+  PAID
+  OVERDUE
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+enum AssetStatus {
+  ACTIVO
+  DADO_DE_BAJA
+  EN_MANTENIMIENTO
+}
+
+enum DepreciationMethod {
+  LINEAL
+  ACELERADA
+  UNIDADES_PRODUCCION
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  RETURNED
+  CANCELLED
+}
+
+enum TransactionType {
+  DEPOSITO
+  RETIRO
+  TRANSFERENCIA
+  CHEQUE
+  NOTA_DEBITO
+  NOTA_CREDITO
+}
+
+enum ProductionStatus {
+  PLANNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  PROPOSAL
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
 
 // ─── AUTH & USERS ─────────────────────────────────────────────────────────────
 
